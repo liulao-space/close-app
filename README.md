@@ -1,6 +1,10 @@
 # CloseApps — 应用关闭面板
 
-一个 macOS 原生小工具：半透明毛玻璃面板，以**卡片网格**列出正在运行的应用；每张卡片**下方直接显示该应用打开的窗口列表**（含标题），卡片右上角 **✕** 可将应用连同所有辅助进程**彻底关闭**。
+<p align="center">
+  <img src="assets/screenshot-panel.png" width="480" alt="应用关闭面板：毛玻璃卡片列出正在运行的应用，✕ 一键彻底关闭">
+</p>
+
+一个 macOS 原生小工具：半透明毛玻璃面板，以**统一卡片网格**列出正在运行的应用（图标 / 名称 / PID / 窗口数）；打开 **≥2 个窗口**的应用会跟随显示每张窗口的**窗口卡片**。点应用卡的 **✕** 将其连同所有辅助进程**彻底关闭**；点窗口卡打开该窗口或**只关闭这一个窗口**。
 
 ## 使用
 
@@ -8,7 +12,7 @@
 open CloseApps.app
 ```
 
-应用已安装到 `/Applications/CloseApps.app`，可在启动台（Launchpad）或聚焦搜索（Spotlight）中直接搜索 "CloseApps" 打开。分发给他人：让对方打开 [CloseApps.dmg](CloseApps.dmg)，把 CloseApps.app 拖入 Applications 文件夹即可（未做开发者 ID 签名，他人首次打开需右键 →「打开」绕过 Gatekeeper）。
+应用已安装到 `/Applications/CloseApps.app`，可在启动台（Launchpad）或聚焦搜索（Spotlight）中直接搜索 "CloseApps" 打开。给他人安装：让对方到 [Releases](../../releases) 下载 `CloseApps.dmg`，按 [安装指南](#给使用者的安装指南) 操作即可。
 
 - 面板整体为**半透明毛玻璃**（`NSVisualEffectView` + `underWindowBackground` 材质），能透出桌面和背后的窗口，亮暗模式自动适配；标题栏已隐藏文字，按住面板空白处即可拖动
 - 卡片为系统原生**振动材质**（`popover`），同样半透明；鼠标悬停时卡片切换为强调高亮、✕ 变红 —— 与通知中心小组件的交互一致
