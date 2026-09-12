@@ -25,6 +25,30 @@ open CloseApps.app
 显示窗口标题需要「辅助功能」权限：打开 **系统设置 → 隐私与安全性 → 辅助功能**，勾选 CloseApps（面板顶部有横幅一键跳转）。不授权也能用，只是看不到窗口列表。注意：本应用用 ad-hoc 签名，**每次重新编译后 macOS 会视为新应用**，需要把列表里的 CloseApps 取消勾选再重新勾选一次。
 - 面板自己不会出现在列表里（防止把自己关掉）；后台进程（菜单栏工具等）也不显示，只列出有窗口的常规应用
 
+## 给使用者的安装指南
+
+**方式一：下载安装包（推荐，支持 Apple Silicon 和 Intel 芯片）**
+
+1. 到 [Releases](../../releases) 页面下载最新的 `CloseApps.dmg`
+2. 打开 DMG，把 CloseApps.app 拖入 Applications 文件夹
+3. 首次打开会被 Gatekeeper 拦截（应用未经过 Apple 公证）：打开 **系统设置 → 隐私与安全性**，拉到下面找到「CloseApps 已被阻止」，点 **仍要打开** → 输密码确认。这只在第一次需要
+4. 打开应用后，如果需要显示窗口卡片：点面板顶部横幅（或手动到 **系统设置 → 隐私与安全性 → 辅助功能**）勾选 CloseApps
+
+**方式二：自己编译（有命令行基础）**
+
+```bash
+git clone https://github.com/liulao-space/close-app.git
+cd close-app
+./build.sh          # 需要 xcode-select --install 装过的命令行工具
+open CloseApps.app
+```
+
+自己编译的版本本机运行不受 Gatekeeper 限制；`build.sh` 找不到 `CloseApps Dev` 签名身份时自动退回 ad-hoc 签名，不影响功能。
+
+> 为什么首次打开这么麻烦？本应用不在 Mac App Store 上架（沙盒会禁用「彻底关闭」核心功能），也没有购买开发者计划做公证。若将来公证，这一步会消失。
+
+
+
 ## 应用图标（Logo）
 
 图标用 CoreGraphics 脚本生成：深色圆角底板上三张毛玻璃卡片（蓝 / 绿 / 橙圆点），右下角一枚红色关闭徽章（白色 ✕），呼应应用本身的功能。

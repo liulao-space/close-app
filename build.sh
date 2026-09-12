@@ -9,7 +9,12 @@ BIN_NAME="CloseApps"
 rm -rf "$APP_NAME"
 mkdir -p "$APP_NAME/Contents/MacOS"
 
-swiftc -swift-version 5 -O -framework AppKit src/main.swift -o "$APP_NAME/Contents/MacOS/$BIN_NAME"
+# 通用二进制（Apple Silicon + Intel）：分架构编译后用 lipo 合并，
+# 任何人下载都能运行
+swiftc -swift-version 5 -O -target arm64-apple-macos11.0 -framework AppKit src/main.swift -o /tmp/closeapps_arm64
+swiftc -swift-version 5 -O -target x86_64-apple-macos11.0 -framework AppKit src/main.swift -o /tmp/closeapps_x64
+lipo -create /tmp/closeapps_arm64 /tmp/closeapps_x64 -output "$APP_NAME/Contents/MacOS/$BIN_NAME"
+rm -f /tmp/closeapps_arm64 /tmp/closeapps_x64
 cp src/Info.plist "$APP_NAME/Contents/Info.plist"
 mkdir -p "$APP_NAME/Contents/Resources"
 if [ -f assets/AppIcon.icns ]; then
