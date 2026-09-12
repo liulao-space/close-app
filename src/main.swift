@@ -1,55 +1,105 @@
 import AppKit
+import ApplicationServices
+import Darwin
 
-// MARK: - 卡片网格容器（手动流式布局，自动按窗口宽度分列）
+// MARK: - 窗口信息（Accessibility API）
 
-final class CardGridView: NSView {
-    static let cardSize = NSSize(width: 120, height: 104)
-    static let hSpacing: CGFloat = 12
-    static let vSpacing: CGFloat = 12
-    static let padding: CGFloat = 10
-
-    private(set) var cards: [AppCardView] = []
-
-    override var isFlipped: Bool { true }
-
-    func setCards(_ newCards: [AppCardView]) {
-        cards.forEach { $0.removeFromSuperview() }
-        cards = newCards
-        cards.forEach { addSubview($0) }
-        needsLayout = true
+final class WinInfo {
+    let title: String
+    let minimized: Bool
+    let ref: AXUIElement
+    init(title: String, minimized: Bool, ref: AXUIElement) {
+        self.title = title
+        self.minimized = minimized
+        self.ref = ref
     }
+    /// 前置并聚焦这个具体窗口（跨桌面切换由系统处理）
+    func raise() {
+        AXUIElementPerformAction(ref, kAXRaiseAction as CFString)
+    }
+}
 
-    override func layout() {
-        super.layout()
-        let contentWidth = bounds.width
-        let availWidth = max(contentWidth - 2 * Self.padding, 0)
-        var columns = Int((availWidth + Self.hSpacing) / (Self.cardSize.width + Self.hSpacing))
-        columns = max(columns, 1)
-        let gridWidth = CGFloat(columns) * Self.cardSize.width + CGFloat(columns - 1) * Self.hSpacing
-        let startX = (contentWidth - gridWidth) / 2
+private func axTrusted() -> Bool { AXIsProcessTrusted() }
 
-        for (index, card) in cards.enumerated() {
-            let column = index % columns
-            let row = index / columns
-            card.frame = NSRect(
-                x: startX + CGFloat(column) * (Self.cardSize.width + Self.hSpacing),
-                y: Self.padding + CGFloat(row) * (Self.cardSize.height + Self.vSpacing),
-                width: Self.cardSize.width,
-                height: Self.cardSize.height
-            )
+private func axWindows(for app: NSRunningApplication) -> [WinInfo] {
+    let appRef = AXUIElementCreateApplication(app.processIdentifier)
+    var out: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &out) == .success,
+          let windows = out as? [AXUIElement] else { return [] }
+    var result: [WinInfo] = []
+    for w in windows {
+        var t: CFTypeRef?
+        var title = ""
+        if AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &t) == .success,
+           let s = t as? String {
+            title = s
         }
+        var m: CFTypeRef?
+        let minimized = AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute as CFString, &m) == .success
+            && (m as? Bool ?? false)
+        result.append(WinInfo(title: title, minimized: minimized, ref: w))
+    }
+    return result
+}
 
-        let rows = max((cards.count + columns - 1) / columns, 1)
-        let newHeight = Self.padding * 2 + CGFloat(rows) * Self.cardSize.height + CGFloat(rows - 1) * Self.vSpacing
-        if abs(frame.height - newHeight) > 0.5 {
-            frame.size = NSSize(width: frame.width, height: newHeight)
+private func axCloseWindow(_ win: AXUIElement) {
+    var b: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(win, kAXCloseButtonAttribute as CFString, &b) == .success,
+          let raw = b else { return }
+    let btn = unsafeBitCast(raw, to: AXUIElement.self)
+    AXUIElementPerformAction(btn, kAXPressAction as CFString)
+}
+
+// MARK: - 进程树收集（彻底关闭：主进程 + 后代 + 同 bundle 路径进程）
+
+private func collectProcessTree(rootPid: pid_t, bundlePath: String?) -> [pid_t] {
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+    var size: Int = 0
+    sysctl(&mib, 3, nil, &size, nil, 0)
+    guard size > 0 else { return [rootPid] }
+    let count = size / MemoryLayout<kinfo_proc>.stride
+    var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+    guard sysctl(&mib, 3, &procs, &size, nil, 0) == 0 else { return [rootPid] }
+
+    var children: [pid_t: [pid_t]] = [:]
+    var result: Set<pid_t> = [rootPid]
+    for p in procs where p.kp_proc.p_pid > 0 && p.kp_eproc.e_ppid > 0 {
+        children[p.kp_eproc.e_ppid, default: []].append(p.kp_proc.p_pid)
+    }
+    var queue: [pid_t] = [rootPid]
+    while !queue.isEmpty {
+        let cur = queue.removeFirst()
+        for child in children[cur] ?? [] where !result.contains(child) {
+            result.insert(child)
+            queue.append(child)
+        }
+    }
+    // 同 bundle 路径的独立进程（不经主进程派生的辅助进程）
+    if let bp = bundlePath {
+        for p in procs {
+            let pid = p.kp_proc.p_pid
+            guard pid > 0, !result.contains(pid) else { continue }
+            var buf = [CChar](repeating: 0, count: 4096)
+            if proc_pidpath(pid, &buf, 4096) > 0 {
+                let path = String(cString: buf)
+                if path.hasPrefix(bp) { result.insert(pid) }
+            }
+        }
+    }
+    return Array(result)
+}
+
+private func killTreeIfAlive(_ pids: [pid_t]) {
+    for pid in pids where pid > 1 {
+        if kill(pid, 0) == 0 || errno == EPERM {
+            kill(pid, SIGKILL)
         }
     }
 }
 
-// MARK: - 单张应用卡片（系统原生振动材质，悬停时呈现"强调"高亮）
+// MARK: - 应用卡片（图标 + 名称 + PID/窗口数 + ✕）
 
-final class AppCardView: NSVisualEffectView {
+final class AppCardView: NSView {
     let app: NSRunningApplication
     private weak var panel: AppDelegate?
 
@@ -58,21 +108,16 @@ final class AppCardView: NSVisualEffectView {
     private var isHovering = false
     private var isClosing = false
 
-    init(app: NSRunningApplication, panel: AppDelegate) {
+    init(app: NSRunningApplication, windowsCount: Int, panel: AppDelegate) {
         self.app = app
         self.panel = panel
         super.init(frame: .zero)
-
-        // 通知中心小组件同款材质：半透明，悬停时切换为强调外观
-        material = .popover
-        blendingMode = .behindWindow
-        state = .active
         wantsLayer = true
-        layer?.cornerRadius = 10
-        layer?.masksToBounds = true
 
         let name = app.localizedName ?? "未知应用"
-        toolTip = "点击激活「\(name)」，点右上角 ✕ 彻底关闭"
+        toolTip = windowsCount > 1
+            ? "「\(name)」有 \(windowsCount) 个窗口 · 点 ✕ 彻底关闭 · 点卡片激活"
+            : "点击激活「\(name)」，点右上角 ✕ 彻底关闭"
 
         let iconView = NSImageView(image: app.icon ?? NSApp.applicationIconImage)
         iconView.imageScaling = .scaleProportionallyUpOrDown
@@ -84,10 +129,13 @@ final class AppCardView: NSVisualEffectView {
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let pidLabel = NSTextField(labelWithString: "PID \(app.processIdentifier)")
+        // 有多个窗口时显示数量徽章
+        let pidText = windowsCount > 1 ? "PID \(app.processIdentifier) · \(windowsCount) 窗口" : "PID \(app.processIdentifier)"
+        let pidLabel = NSTextField(labelWithString: pidText)
         pidLabel.font = .systemFont(ofSize: 10)
         pidLabel.textColor = .secondaryLabelColor
         pidLabel.alignment = .center
+        pidLabel.lineBreakMode = .byTruncatingTail
         pidLabel.translatesAutoresizingMaskIntoConstraints = false
 
         closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "关闭")?
@@ -97,7 +145,7 @@ final class AppCardView: NSVisualEffectView {
         closeButton.contentTintColor = .secondaryLabelColor
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
-        closeButton.toolTip = "彻底关闭"
+        closeButton.toolTip = "彻底关闭整个应用（含所有辅助进程）"
         closeButton.setAccessibilityLabel("彻底关闭 \(name)")
         closeButton.translatesAutoresizingMaskIntoConstraints = false
 
@@ -117,8 +165,8 @@ final class AppCardView: NSVisualEffectView {
             nameLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
 
             pidLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 1),
-            pidLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            pidLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            pidLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            pidLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
 
             closeButton.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
@@ -133,7 +181,12 @@ final class AppCardView: NSVisualEffectView {
     override var isFlipped: Bool { true }
 
     private func refreshAppearance() {
-        isEmphasized = isHovering
+        guard let layer else { return }
+        layer.backgroundColor = (isHovering ? NSColor.controlAccentColor : NSColor.white)
+            .withAlphaComponent(isHovering ? 0.18 : 0.10).cgColor
+        layer.cornerRadius = 10
+        layer.borderWidth = 1
+        layer.borderColor = NSColor.separatorColor.withAlphaComponent(0.7).cgColor
         closeButton.contentTintColor = isHovering ? .systemRed : .secondaryLabelColor
     }
 
@@ -146,28 +199,20 @@ final class AppCardView: NSVisualEffectView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways],
-            owner: self,
-            userInfo: nil
-        )
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil)
         addTrackingArea(area)
         trackingArea = area
     }
 
-    override func mouseEntered(with event: NSEvent) {
-        isHovering = true
-        refreshAppearance()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovering = false
-        refreshAppearance()
-    }
+    override func mouseEntered(with event: NSEvent) { isHovering = true; refreshAppearance() }
+    override func mouseExited(with event: NSEvent) { isHovering = false; refreshAppearance() }
 
     override func mouseDown(with event: NSEvent) {
         guard !isClosing else { return }
+        // 打开 bundle 等同于点击 Dock 图标：自动切换到该应用所在的桌面并前置
+        if let bundleURL = app.bundleURL {
+            NSWorkspace.shared.open(bundleURL)
+        }
         if #available(macOS 14.0, *) {
             app.activate(from: .current)
         } else {
@@ -180,6 +225,178 @@ final class AppCardView: NSVisualEffectView {
     }
 }
 
+// MARK: - 窗口卡片（与应用主卡片同款的大卡片：图标 + 标题 + ✕）
+// 点击打开该窗口，✕ 只关闭这一个窗口；最小化的窗口半透明显示
+
+final class WindowCardView: NSView {
+    static let height: CGFloat = 104
+
+    private let win: WinInfo
+    private let app: NSRunningApplication
+    private weak var panel: AppDelegate?
+
+    private let closeButton = NSButton()
+    private var trackingArea: NSTrackingArea?
+    private var isHovering = false
+
+    init(win: WinInfo, app: NSRunningApplication, panel: AppDelegate) {
+        self.win = win
+        self.app = app
+        self.panel = panel
+        super.init(frame: .zero)
+        wantsLayer = true
+
+        let appName = app.localizedName ?? "未知应用"
+        let displayTitle = win.title.isEmpty ? appName : win.title
+        toolTip = "「\(appName)」的窗口：\(displayTitle)\n点击打开这个窗口 · 点 ✕ 只关闭它"
+        setAccessibilityLabel("窗口卡片 \(appName) \(displayTitle)")
+
+        let iconView = NSImageView(image: app.icon ?? NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil) ?? NSImage())
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: displayTitle)
+        titleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        titleLabel.alignment = .center
+        titleLabel.lineBreakMode = .byTruncatingMiddle
+        titleLabel.textColor = win.minimized ? .secondaryLabelColor : .labelColor
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let statusLabel = NSTextField(labelWithString: "\(appName) · \(win.minimized ? "已最小化" : "点击打开")")
+        statusLabel.font = .systemFont(ofSize: 9)
+        statusLabel.textColor = .tertiaryLabelColor
+        statusLabel.alignment = .center
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "关闭窗口")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
+        closeButton.isBordered = false
+        closeButton.setButtonType(.momentaryChange)
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+        closeButton.toolTip = "关闭窗口「\(displayTitle)」"
+        closeButton.setAccessibilityLabel("关闭窗口 \(displayTitle)")
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(iconView)
+        addSubview(titleLabel)
+        addSubview(statusLabel)
+        addSubview(closeButton)
+
+        NSLayoutConstraint.activate([
+            iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            iconView.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            iconView.widthAnchor.constraint(equalToConstant: 34),
+            iconView.heightAnchor.constraint(equalToConstant: 34),
+
+            nameLabelCommon(titleLabel, below: iconView),
+
+            statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            statusLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+
+            closeButton.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            closeButton.widthAnchor.constraint(equalToConstant: 20),
+            closeButton.heightAnchor.constraint(equalToConstant: 20),
+        ])
+        if win.minimized { alphaValue = 0.6 }
+        refreshAppearance()
+    }
+
+    private func nameLabelCommon(_ label: NSTextField, below icon: NSImageView) -> NSLayoutConstraint {
+        label.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 4)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not implemented") }
+
+    private func refreshAppearance() {
+        guard let layer else { return }
+        layer.backgroundColor = (isHovering ? NSColor.controlAccentColor : NSColor.white)
+            .withAlphaComponent(isHovering ? 0.18 : 0.10).cgColor
+        layer.cornerRadius = 10
+        layer.borderWidth = 1
+        layer.borderColor = NSColor.separatorColor.withAlphaComponent(0.7).cgColor
+        closeButton.contentTintColor = isHovering ? .systemRed : .secondaryLabelColor
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+    override func mouseEntered(with event: NSEvent) { isHovering = true; refreshAppearance() }
+    override func mouseExited(with event: NSEvent) { isHovering = false; refreshAppearance() }
+
+    override func mouseDown(with event: NSEvent) {
+        // 前置这个具体窗口（最小化的自动还原）
+        win.raise()
+    }
+
+    @objc private func closeClicked() {
+        closeButton.isEnabled = false
+        alphaValue = 0.35
+        axCloseWindow(win.ref)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.panel?.reload(force: true)
+        }
+    }
+}
+
+// MARK: - 统一卡片流（应用卡与窗口卡同尺寸，连续流式排列，不留空位）
+
+final class CardGridView: NSView {
+    static let cardSize = NSSize(width: 120, height: 104)
+    static let hSpacing: CGFloat = 12
+    static let vSpacing: CGFloat = 12
+    static let padding: CGFloat = 10
+
+    private var cards: [NSView] = []
+
+    override var isFlipped: Bool { true }
+
+    func setCards(_ newCards: [NSView]) {
+        cards.forEach { $0.removeFromSuperview() }
+        cards = newCards
+        cards.forEach { addSubview($0) }
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    private var columns: Int {
+        let avail = max(bounds.width - 2 * Self.padding, 0)
+        return max(Int((avail + Self.hSpacing) / (Self.cardSize.width + Self.hSpacing)), 1)
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let cols = columns
+        let rows = max((cards.count + cols - 1) / cols, 1)
+        return NSSize(width: bounds.width,
+                      height: Self.padding * 2 + CGFloat(rows) * Self.cardSize.height + CGFloat(rows - 1) * Self.vSpacing)
+    }
+
+    override func layout() {
+        super.layout()
+        let cols = columns
+        let gridWidth = CGFloat(cols) * Self.cardSize.width + CGFloat(cols - 1) * Self.hSpacing
+        let startX = (bounds.width - gridWidth) / 2
+        for (index, card) in cards.enumerated() {
+            let row = index / cols
+            let column = index % cols
+            card.frame = NSRect(
+                x: startX + CGFloat(column) * (Self.cardSize.width + Self.hSpacing),
+                y: Self.padding + CGFloat(row) * (Self.cardSize.height + Self.vSpacing),
+                width: Self.cardSize.width,
+                height: Self.cardSize.height
+            )
+        }
+        invalidateIntrinsicContentSize()
+    }
+}
+
 // MARK: - 面板控制器
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -189,24 +406,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var countLabel: NSTextField!
     private var statusLabel: NSTextField!
     private var refreshButton: NSButton!
+    private var authBanner: NSButton!
+    private var authBannerHeight: NSLayoutConstraint!
+    private var pinButton: NSButton!
+    private var isPinned = false
+    private let pinKey = "panelAlwaysOnTop"
 
     private var apps: [NSRunningApplication] = []
+    private var lastSignature: [String] = []
+    private var reloadCounter = 0
     private var refreshTimer: Timer?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var statusResetItem: DispatchWorkItem?
 
-    private let defaultStatus = "点击卡片右上角的 ✕ 彻底关闭应用；点击卡片本身可激活该应用"
+    private let defaultStatus = "✕ 彻底关闭应用 · 点窗口卡片打开/关单个窗口 · 📌 置顶"
 
     // MARK: 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildUI()
+        setPinned(UserDefaults.standard.bool(forKey: pinKey), silent: true)
         reload(force: true)
 
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.reload()
         }
-
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(center.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
@@ -228,13 +452,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildUI() {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 596, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         win.title = "应用关闭面板"
-        win.minSize = NSSize(width: 300, height: 420)
+        win.minSize = NSSize(width: 360, height: 480)
         win.isOpaque = false
         win.backgroundColor = .clear
         win.titlebarAppearsTransparent = true
@@ -243,8 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.center()
         window = win
 
-        // 整个面板的毛玻璃底板（透出桌面/背后窗口，随亮暗模式自适应）
-        let blur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 460, height: 620))
+        let blur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 596, height: 680))
         blur.material = .underWindowBackground
         blur.blendingMode = .behindWindow
         blur.state = .active
@@ -261,13 +484,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.controlSize = .small
         refreshButton.translatesAutoresizingMaskIntoConstraints = false
 
+        pinButton = NSButton()
+        pinButton.image = NSImage(systemSymbolName: "pin", accessibilityDescription: "置顶")?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .medium))
+        pinButton.isBordered = false
+        pinButton.contentTintColor = .secondaryLabelColor
+        pinButton.target = self
+        pinButton.action = #selector(togglePin)
+        pinButton.toolTip = "面板置顶（始终显示在最前）"
+        pinButton.setAccessibilityLabel("面板置顶")
+        pinButton.translatesAutoresizingMaskIntoConstraints = false
+
+        authBanner = NSButton(
+            title: "打开「系统设置 › 隐私与安全性 › 辅助功能」，勾选 CloseApps 以显示窗口列表 →",
+            target: self,
+            action: #selector(openAXSettings)
+        )
+        authBanner.font = .systemFont(ofSize: 11)
+        authBanner.isBordered = false
+        authBanner.contentTintColor = .systemOrange
+        authBanner.alignment = .center
+        authBanner.translatesAutoresizingMaskIntoConstraints = false
+
         statusLabel = NSTextField(labelWithString: defaultStatus)
         statusLabel.font = .systemFont(ofSize: 12)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        cardGrid = CardGridView(frame: NSRect(x: 0, y: 0, width: 428, height: 100))
+        cardGrid = CardGridView(frame: .zero)
         cardGrid.translatesAutoresizingMaskIntoConstraints = false
 
         let scrollView = NSScrollView()
@@ -285,9 +530,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         content.addSubview(countLabel)
         content.addSubview(refreshButton)
+        content.addSubview(pinButton)
+        content.addSubview(authBanner)
         content.addSubview(scrollView)
         content.addSubview(emptyLabel)
         content.addSubview(statusLabel)
+
+        authBannerHeight = authBanner.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
             countLabel.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor, constant: 8),
@@ -296,12 +545,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             refreshButton.centerYAnchor.constraint(equalTo: countLabel.centerYAnchor),
             refreshButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
 
-            scrollView.topAnchor.constraint(equalTo: countLabel.bottomAnchor, constant: 10),
+            pinButton.centerYAnchor.constraint(equalTo: refreshButton.centerYAnchor),
+            pinButton.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -10),
+            pinButton.widthAnchor.constraint(equalToConstant: 26),
+            pinButton.heightAnchor.constraint(equalToConstant: 24),
+
+            authBanner.topAnchor.constraint(equalTo: countLabel.bottomAnchor, constant: 4),
+            authBanner.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            authBanner.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            authBannerHeight,
+
+            scrollView.topAnchor.constraint(equalTo: authBanner.bottomAnchor, constant: 6),
             scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             scrollView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -10),
 
             cardGrid.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            cardGrid.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
 
             emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
@@ -324,43 +584,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func reload(force: Bool = false) {
+    func reload(force: Bool = false) {
+        reloadCounter += 1
+        let trusted = axTrusted()
+        authBanner.isHidden = trusted
+        authBannerHeight.isActive = !trusted
+        authBannerHeight.constant = trusted ? 0 : 18
+        if !trusted { authBannerHeight.constant = 18 }
+
         let current = visibleApps.sorted {
             ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
         }
-        if !force, current.map({ $0.processIdentifier }) == apps.map({ $0.processIdentifier }) { return }
+        var windowsByPid: [pid_t: [WinInfo]] = [:]
+        if trusted {
+            for app in current {
+                // 过滤无标题的隐藏窗口，只有真实可见窗口才计
+                windowsByPid[app.processIdentifier] = axWindows(for: app).filter { !$0.title.isEmpty }
+            }
+        }
+
+        // 签名：进程集合 + 窗口数量；数量没变时跳过重建（每 10 秒强制重建一次以刷新标题）
+        let signature = current.map { "\($0.processIdentifier)|\(windowsByPid[$0.processIdentifier]?.count ?? 0)" }
+        let periodic = reloadCounter % 5 == 0
+        if !force && !periodic && signature == lastSignature { return }
+        lastSignature = signature
         apps = current
+
         countLabel.stringValue = "正在运行的应用（\(apps.count)）"
-        cardGrid.setCards(apps.map { AppCardView(app: $0, panel: self) })
+        // 扁平卡片流：应用卡在前，其窗口卡紧随其后（仅显示 ≥2 个窗口的应用，
+        // 0/1 个窗口时应用卡已覆盖该窗口，不再额外显示）
+        var cards: [NSView] = []
+        for app in apps {
+            let wins = windowsByPid[app.processIdentifier] ?? []
+            cards.append(AppCardView(app: app, windowsCount: wins.count, panel: self))
+            if wins.count >= 2 {
+                for win in wins { cards.append(WindowCardView(win: win, app: app, panel: self)) }
+            }
+        }
+        cardGrid.setCards(cards)
         emptyLabel.isHidden = !apps.isEmpty
     }
 
-    // MARK: 关闭应用
+    // MARK: 关闭应用（整个进程树）
 
     func forceClose(_ app: NSRunningApplication, card: AppCardView? = nil) {
         let name = app.localizedName ?? "未知应用"
         let pid = app.processIdentifier
+        let bundlePath = app.bundleURL?.path
         card?.markClosing()
-        setStatus("正在关闭「\(name)」…")
+        setStatus("正在彻底关闭「\(name)」…")
 
-        // 先礼貌退出；2.5 秒后仍存活则 SIGKILL，保证"彻底关闭"
+        // 立刻记下整个进程树（后代 + 同 bundle 路径进程），保证辅助进程也被清理
+        let tree = collectProcessTree(rootPid: pid, bundlePath: bundlePath)
         if !app.terminate() {
             kill(pid, SIGTERM)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             guard let self else { return }
             if !app.isTerminated {
-                kill(pid, SIGKILL)
+                killTreeIfAlive(tree)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self else { return }
                 self.reload(force: true)
-                self.setStatus(app.isTerminated ? "✓ 已彻底关闭「\(name)」" : "✗ 未能关闭「\(name)」")
+                self.setStatus(app.isTerminated ? "✓ 已彻底关闭「\(name)」(含 \(tree.count) 个进程)" : "✗ 未能关闭「\(name)」")
             }
         }
     }
 
+    // MARK: 面板置顶
+
+    @objc private func togglePin() {
+        setPinned(!isPinned)
+    }
+
+    private func setPinned(_ pinned: Bool, silent: Bool = false) {
+        isPinned = pinned
+        window.level = pinned ? .floating : .normal
+        UserDefaults.standard.set(pinned, forKey: pinKey)
+        pinButton.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: "置顶")?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .medium))
+        pinButton.contentTintColor = pinned ? .controlAccentColor : .secondaryLabelColor
+        pinButton.toolTip = pinned ? "取消置顶" : "面板置顶（始终显示在最前）"
+        if !silent {
+            setStatus(pinned ? "✓ 面板已置顶" : "已取消置顶")
+        }
+    }
+
     // MARK: 其他操作
+
+    @objc private func openAXSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
 
     @objc private func manualRefresh() {
         reload(force: true)

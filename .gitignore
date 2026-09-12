@@ -1,2 +1,7 @@
 CloseApps.dmg
 CloseApps.app
+signing/
+*.pem
+*.p12
+*.cer
+.DS_Store
