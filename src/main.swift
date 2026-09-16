@@ -1,6 +1,48 @@
 import AppKit
 import ApplicationServices
+import Carbon
 import Darwin
+import ServiceManagement
+
+// MARK: - 常量
+
+private enum Cfg {
+    /// 折叠态的宽度（高度随屏幕定：无刘海屏 = 菜单栏高，做成"假刘海"）
+    static let capsuleWidth: CGFloat = 176
+    /// 初始/兜底尺寸（真正的尺寸由 islandFrame 按屏幕算）
+    static let capsuleSize = NSSize(width: 176, height: 36)
+    /// 折叠态下缘两角的圆角半径（上缘是直角）—— 就是 CSS 的 `border-radius: 0 0 16px 16px`。
+    /// **折叠态只要看得见，一律是这个形状**：无刘海屏那枚"假刘海"贴屏幕顶沿；
+    /// 有刘海屏关掉「折叠时藏进刘海」时那枚胶囊吊在刘海正下方，上缘直角正好跟刘海接上。
+    static let fakeNotchRadius: CGFloat = 16
+    /// 折叠态藏进刘海时，往刘海下方多留这么一点做悬停容错。
+    /// 刘海是物理盲区（摄像头模组挡着，那块屏幕不显示内容），面板整体又是透明的，
+    /// 所以多出来的这一条不会显形，只是让鼠标更容易扫到。
+    static let notchHoverMargin: CGFloat = 12
+    /// 展开态面板
+    static let expandedSize = NSSize(width: 596, height: 620)
+    static let headerHeight: CGFloat = 36
+    static let cornerRadius: CGFloat = 18
+    /// 展开/收起的弹簧响应时间（大约走完要这么久）。0.30s 是「看得见过程但不拖沓」的长度：
+    /// 再短就成「啪」地一下，再长会让人觉得面板在慢慢地爬。
+    static let expandResponse: TimeInterval = 0.26
+    static let collapseResponse: TimeInterval = 0.18
+    /// 弹簧阻尼比。略小于 1 → 末端轻轻过冲约 1.5% 再收住，这就是「丝滑」和「生硬」的分界；
+    /// 等于 1 是临界阻尼（不过冲，但收尾发闷），大于 1 会拖泥带水。
+    static let morphDamping: Double = 0.78
+    /// 拖动时面板离屏幕边缘至少留这么远，拖不丢
+    static let dragEdgeMargin: CGFloat = 8
+    /// 鼠标移开后多久收起
+    static let collapseDelay: TimeInterval = 0.45
+    /// 展开态检查鼠标真实位置的间隔（收起与否只看坐标，不看控件的进出事件）
+    static let hoverPollInterval: TimeInterval = 0.06
+    /// 收起时鼠标还赖在命中区里 → 先不忙重开，等它挪开；这是最长等待兜底
+    static let reopenGuardFallback: TimeInterval = 1.5
+    static let refreshInterval: TimeInterval = 2.0
+    static var detailSize: NSSize {
+        NSSize(width: expandedSize.width, height: expandedSize.height - headerHeight)
+    }
+}
 
 // MARK: - 窗口信息（Accessibility API）
 
@@ -129,7 +171,6 @@ final class AppCardView: NSView {
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        // 有多个窗口时显示数量徽章
         let pidText = windowsCount > 1 ? "PID \(app.processIdentifier) · \(windowsCount) 窗口" : "PID \(app.processIdentifier)"
         let pidLabel = NSTextField(labelWithString: pidText)
         pidLabel.font = .systemFont(ofSize: 10)
@@ -180,6 +221,9 @@ final class AppCardView: NSView {
 
     override var isFlipped: Bool { true }
 
+    /// 面板不是 key window 时，第一次点击也要立刻生效
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     private func refreshAppearance() {
         guard let layer else { return }
         layer.backgroundColor = (isHovering ? NSColor.controlAccentColor : NSColor.white)
@@ -218,6 +262,8 @@ final class AppCardView: NSView {
         } else {
             app.activate(options: [.activateIgnoringOtherApps])
         }
+        // 目的已达成（切到别的应用去了），面板跟着收起
+        panel?.collapseAfterActivating(appName: app.localizedName ?? "应用")
     }
 
     @objc private func closeClicked() {
@@ -290,7 +336,9 @@ final class WindowCardView: NSView {
             iconView.widthAnchor.constraint(equalToConstant: 34),
             iconView.heightAnchor.constraint(equalToConstant: 34),
 
-            nameLabelCommon(titleLabel, below: iconView),
+            titleLabel.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 4),
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
 
             statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
             statusLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
@@ -305,11 +353,9 @@ final class WindowCardView: NSView {
         refreshAppearance()
     }
 
-    private func nameLabelCommon(_ label: NSTextField, below icon: NSImageView) -> NSLayoutConstraint {
-        label.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 4)
-    }
-
     required init?(coder: NSCoder) { fatalError("not implemented") }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func refreshAppearance() {
         guard let layer else { return }
@@ -334,6 +380,7 @@ final class WindowCardView: NSView {
     override func mouseDown(with event: NSEvent) {
         // 前置这个具体窗口（最小化的自动还原）
         win.raise()
+        panel?.collapseAfterActivating(appName: app.localizedName ?? "应用")
     }
 
     @objc private func closeClicked() {
@@ -393,107 +440,1139 @@ final class CardGridView: NSView {
                 height: Self.cardSize.height
             )
         }
+        invalidateContentSize()
+    }
+
+    private func invalidateContentSize() {
         invalidateIntrinsicContentSize()
+    }
+}
+
+// MARK: - 全局快捷键（Carbon RegisterEventHotKey：公开 API，不需要辅助功能/输入监控权限）
+
+private var gHotKeyManager: HotKeyManager?
+
+final class HotKeyManager {
+    static let signature: OSType = 0x434C4150 // 'CLAP'
+
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
+    var onTrigger: (() -> Void)?
+
+    var isRegistered: Bool { hotKeyRef != nil }
+
+    init() {
+        gHotKeyManager = self
+        installHandler()
+    }
+
+    deinit {
+        unregister()
+        if let handlerRef { RemoveEventHandler(handlerRef) }
+    }
+
+    private func installHandler() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                      eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetEventDispatcherTarget(), { _, event, _ -> OSStatus in
+            guard let event else { return OSStatus(eventNotHandledErr) }
+            var hotKeyID = EventHotKeyID()
+            let err = GetEventParameter(event,
+                                        EventParamName(kEventParamDirectObject),
+                                        EventParamType(typeEventHotKeyID),
+                                        nil,
+                                        MemoryLayout<EventHotKeyID>.size,
+                                        nil,
+                                        &hotKeyID)
+            guard err == noErr, hotKeyID.signature == HotKeyManager.signature else {
+                return OSStatus(eventNotHandledErr)
+            }
+            DispatchQueue.main.async { gHotKeyManager?.onTrigger?() }
+            return noErr
+        }, 1, &eventType, nil, &handlerRef)
+    }
+
+    @discardableResult
+    func register(keyCode: UInt32, modifiers: UInt32) -> Bool {
+        unregister()
+        guard keyCode != 0, modifiers != 0 else { return false }
+        var ref: EventHotKeyRef?
+        let id = EventHotKeyID(signature: Self.signature, id: 1)
+        let status = RegisterEventHotKey(keyCode, modifiers, id, GetEventDispatcherTarget(), 0, &ref)
+        guard status == noErr, let ref else { return false }
+        hotKeyRef = ref
+        return true
+    }
+
+    func unregister() {
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
+        }
+    }
+}
+
+// MARK: - 快捷键录制控件（点击后按下组合键即可改键）
+
+final class HotKeyRecorder: NSView {
+    var onClick: (() -> Void)?
+    var onCapture: ((UInt32, UInt32, String) -> Void)?
+    var onCancel: (() -> Void)?
+
+    private let textField = NSTextField(labelWithString: "")
+    private var trackingArea: NSTrackingArea?
+    private var isHovering = false
+
+    private(set) var isRecording = false {
+        didSet { refresh() }
+    }
+
+    var label: String = "⌥⌘K" {
+        didSet { refresh() }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        textField.font = .systemFont(ofSize: 11, weight: .medium)
+        textField.alignment = .center
+        textField.lineBreakMode = .byClipping
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(textField)
+        NSLayoutConstraint.activate([
+            textField.centerXAnchor.constraint(equalTo: centerXAnchor),
+            textField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            textField.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 4),
+            textField.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
+        ])
+        toolTip = "点击后按下新的组合键改快捷键（Esc 取消 · Delete 清除）"
+        setAccessibilityLabel("全局快捷键")
+        refresh()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not implemented") }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private func refresh() {
+        guard let layer else { return }
+        textField.stringValue = isRecording ? "按下组合键" : label
+        textField.textColor = isRecording ? .controlAccentColor : (isHovering ? .labelColor : .secondaryLabelColor)
+        layer.backgroundColor = isRecording
+            ? NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor
+            : NSColor.white.withAlphaComponent(isHovering ? 0.16 : 0.08).cgColor
+        layer.cornerRadius = 6
+        layer.borderWidth = 1
+        layer.borderColor = (isRecording ? NSColor.controlAccentColor : NSColor.separatorColor)
+            .withAlphaComponent(isRecording ? 0.9 : 0.7).cgColor
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovering = true; refresh() }
+    override func mouseExited(with event: NSEvent) { isHovering = false; refresh() }
+
+    override func mouseDown(with event: NSEvent) {
+        guard !isRecording else { return }
+        onClick?()
+    }
+
+    func beginRecording() {
+        isRecording = true
+        window?.makeFirstResponder(self)
+    }
+
+    func cancelRecording() {
+        guard isRecording else { return }
+        isRecording = false
+        onCancel?()
+    }
+
+    /// 控件里的标签不该吃掉点击：整块区域都归自己处理
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        return bounds.contains(local) ? self : nil
+    }
+
+    override func resignFirstResponder() -> Bool {
+        cancelRecording()
+        return super.resignFirstResponder()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard isRecording else { super.keyDown(with: event); return }
+
+        // Esc：取消
+        if event.keyCode == 53 {
+            isRecording = false
+            onCancel?()
+            return
+        }
+        // Delete / Backspace：清除快捷键
+        if event.keyCode == 51 || event.keyCode == 117 {
+            isRecording = false
+            onCapture?(0, 0, "无")
+            return
+        }
+
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let carbon = Self.carbonModifiers(flags)
+        let chars = (event.charactersIgnoringModifiers ?? "").uppercased()
+        let isFunctionKey = event.keyCode >= 96 && event.keyCode <= 133
+
+        guard carbon != 0 || isFunctionKey else {
+            NSSound.beep()
+            return
+        }
+        let keyName = chars.isEmpty ? Self.functionKeyName(event.keyCode) : chars
+        let newLabel = Self.modifierSymbols(flags) + keyName
+        isRecording = false
+        onCapture?(UInt32(event.keyCode), carbon, newLabel)
+    }
+
+    static func carbonModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        var mods: UInt32 = 0
+        if flags.contains(.control) { mods |= UInt32(controlKey) }
+        if flags.contains(.option) { mods |= UInt32(optionKey) }
+        if flags.contains(.shift) { mods |= UInt32(shiftKey) }
+        if flags.contains(.command) { mods |= UInt32(cmdKey) }
+        return mods
+    }
+
+    static func modifierSymbols(_ flags: NSEvent.ModifierFlags) -> String {
+        var s = ""
+        if flags.contains(.control) { s += "⌃" }
+        if flags.contains(.option) { s += "⌥" }
+        if flags.contains(.shift) { s += "⇧" }
+        if flags.contains(.command) { s += "⌘" }
+        return s
+    }
+
+    private static func functionKeyName(_ keyCode: UInt16) -> String {
+        let map: [UInt16: String] = [
+            96: "F5", 97: "F6", 98: "F7", 99: "F3", 100: "F8", 101: "F9",
+            103: "F11", 105: "F13", 107: "F14", 109: "F10", 111: "F12",
+            113: "F15", 114: "Help", 115: "Home", 116: "PageUp", 117: "ForwardDelete",
+            118: "F4", 119: "End", 120: "F2", 121: "PageDown", 122: "F1",
+            123: "←", 124: "→", 125: "↓", 126: "↑",
+        ]
+        return map[keyCode] ?? "Key\(keyCode)"
+    }
+}
+
+// MARK: - 开机启动（macOS 13+ 用 SMAppService；11/12 退回 LaunchAgent）
+
+private enum LoginItem {
+    static let label = "com.liulao.closeapps.launch"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var isEnabled: Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    static var needsApproval: Bool {
+        if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .requiresApproval }
+        return false
+    }
+
+    /// nil = 成功，否则为错误描述
+    @discardableResult
+    static func setEnabled(_ on: Bool) -> String? {
+        if #available(macOS 13.0, *) {
+            do {
+                if on {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        if on {
+            let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+            let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+            \t<key>Label</key><string>\(label)</string>
+            \t<key>ProgramArguments</key><array><string>\(exe)</string></array>
+            \t<key>RunAtLoad</key><true/>
+            \t<key>LimitLoadToSessionType</key><string>Aqua</string>
+            </dict>
+            </plist>
+            """
+            do {
+                try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                try plist.write(to: plistURL, atomically: true, encoding: .utf8)
+                runLaunchctl(["load", "-w", plistURL.path])
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        runLaunchctl(["unload", "-w", plistURL.path])
+        try? FileManager.default.removeItem(at: plistURL)
+        return nil
+    }
+
+    private static func runLaunchctl(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+    }
+}
+
+// MARK: - 灵动岛面板（无边框、不可激活、常驻所有桌面）
+
+final class IslandPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+/// 细一号的滚动条。宽度是**类方法**算出来的（NSScrollView 布局时问它），
+/// 所以只能在子类里覆写 —— 给实例改 controlSize、改 frame 都会被重算回去。
+/// 系统默认 15pt（传统样式）/ 11pt（浮动样式），这里统一给 8pt。
+final class ThinScroller: NSScroller {
+    static let width: CGFloat = 8
+    override class func scrollerWidth(for controlSize: NSControl.ControlSize,
+                                      scrollerStyle: NSScroller.Style) -> CGFloat { ThinScroller.width }
+}
+
+/// 内容视图：负责鼠标进出检测，并按窗口大小裁掉超出部分（折叠时只露出中间的胶囊）
+final class HoverView: NSView {
+    var onEnter: (() -> Void)?
+    var onExit: (() -> Void)?
+    /// 折叠态拖动：回调屏幕坐标增量（Cocoa 坐标，y 向上）
+    var onDrag: ((CGFloat, CGFloat) -> Void)?
+    var onDragBegin: (() -> Void)?
+    var onDragEnd: (() -> Void)?
+    /// 判定"这一点是否归我来拖"（控制器按当前状态决定）。返回 false 就把事件交还子视图，
+    /// 卡片、关闭按钮、录制控件照常工作。
+    var shouldCaptureMouse: ((NSView, NSPoint) -> Bool)?
+
+    private var trackingArea: NSTrackingArea?
+    private var dragAnchor: NSPoint?
+
+    override var isFlipped: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self,
+                                  userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { onEnter?() }
+    override func mouseExited(with event: NSEvent) { onExit?() }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// 拖动区得在命中测试这一层就抢过来：鼠标事件其实先落在最深的子视图上（图标、文字、毛玻璃层），
+    /// 而 AppKit 之后只把 mouseDragged 送给"收到 mouseDown 的那个视图"——被 NSTextField 这类
+    /// 控件吞掉就再也拖不动了。控制器用 shouldCaptureMouse 决定哪些点归拖动。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        guard let shouldCaptureMouse else { return hit }
+        return shouldCaptureMouse(hit, convert(point, from: superview)) ? self : hit
+    }
+
+    // MARK: 拖动（接不接管由控制器的 shouldCaptureMouseForDrag 定：
+    //              折叠态不接管；展开态只接管标题栏空白，按钮等控件一律让路）
+    //
+    // 不调 window.makeKey()：这是不可激活面板，抢 key 会把用户正在打字的那个窗口的
+    // 焦点夺走。鼠标拖拽只要收到 mouseDown 的那个视图就能持续收 mouseDragged。
+
+    override func mouseDown(with event: NSEvent) {
+        dragAnchor = NSEvent.mouseLocation
+        onDragBegin?()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let anchor = dragAnchor else { return }
+        let now = NSEvent.mouseLocation
+        onDrag?(now.x - anchor.x, now.y - anchor.y)
+        dragAnchor = now
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard dragAnchor != nil else { return }
+        dragAnchor = nil
+        onDragEnd?()
+    }
+}
+
+private extension NSScreen {
+    var displayID: UInt32 {
+        (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    }
+
+    /// 菜单栏高度（屏幕顶沿到菜单栏下沿）—— 无刘海屏上折叠条就做成这么高，才像一块真刘海
+    var menuBarHeight: CGFloat { frame.maxY - visibleFrame.maxY }
+
+    /// 刘海矩形（Cocoa 坐标）：屏幕顶部正中那块被摄像头模组物理挡住的区域。
+    /// 没有刘海的屏幕返回 nil —— 那种屏上左右两块 auxiliaryTopArea 会拼满整宽。
+    var notchRect: NSRect? {
+        guard #available(macOS 12.0, *) else { return nil }
+        guard let left = auxiliaryTopLeftArea, let right = auxiliaryTopRightArea else { return nil }
+        let width = frame.width - left.width - right.width
+        let height = safeAreaInsets.top
+        guard width > 60, height > 0 else { return nil }
+        return NSRect(x: frame.minX + left.width,
+                      y: frame.maxY - height,
+                      width: width,
+                      height: height)
+    }
+}
+
+/// 只有 CLOSEAPPS_DEBUG=1 才往 stderr 打点（和 AppDelegate.dbg 同一套开关）
+private func morphLog(_ message: String) {
+    guard ProcessInfo.processInfo.environment["CLOSEAPPS_DEBUG"] != nil else { return }
+    FileHandle.standardError.write(Data(("[closeapps] " + message + "\n").utf8))
+}
+
+// MARK: - 动画（弹簧推进器）
+
+/// 一个最小的弹簧积分器：每帧算出 0 → 1 的进度，落在目标上时自己停。
+///
+/// 为什么不用 `NSAnimationContext`：
+/// ① 它只能吃一条固定时长的贝塞尔曲线，"起步迅速、末端极轻地过冲一下再收住"这种手感做不出来；
+/// ② 它一次只管一组属性，frame 和内容想同步就得各开一组动画 —— 时长只要差一点，
+///    看起来就是"面板先长完、内容再补上"，一眼假（上一版正是这么写的）。
+///
+/// 数值：半隐式欧拉，用真实 dt（夹在 [1/240, 1/30] 之间，某帧卡顿了也不会跳变），
+/// 阻尼比 0.78 → 末端过冲约 2%，刚好是"活"而不是"弹"。
+private final class SpringDriver {
+    private let label: String            // 只用来打点（"展开"/"收起"）
+    private let omega: Double            // 角频率：越大越快
+    private let zeta: Double             // 阻尼比：1 = 临界阻尼（不过冲）
+    private let onStep: (Double, Bool) -> Void
+    private var timer: Timer?
+    private var value: Double = 0        // 当前进度（可能略微超过 1）
+    private var velocity: Double = 0
+    private var lastTick: CFTimeInterval = 0
+    private var startedAt: CFTimeInterval = 0
+    private var ticks = 0
+    private var maxGap: Double = 0       // 最大一帧的间隔：这就是"卡不卡"的直接证据
+    private var dropped = 0              // 间隔超过 2.5 个目标帧 = 这一帧被丢了
+    private var frameInterval: Double = 1.0 / 60
+
+    init(label: String, response: TimeInterval, damping: Double,
+         onStep: @escaping (Double, Bool) -> Void) {
+        self.label = label
+        self.omega = 2 * Double.pi / max(0.06, response)
+        self.zeta = damping
+        self.onStep = onStep
+    }
+
+    /// 按屏幕刷新率起搏（60Hz 屏上不必白跑一倍），挂 `.common` 模式 ——
+    /// 用户这会儿很可能正按着鼠标（run loop 处于 tracking 模式），只挂 default 会原地冻住。
+    func start() {
+        var fps = 60.0
+        if #available(macOS 12.0, *) {
+            for s in NSScreen.screens { fps = max(fps, Double(s.maximumFramesPerSecond)) }
+        }
+        let interval = 1.0 / min(max(fps, 60), 120)
+        frameInterval = interval
+        startedAt = CACurrentMediaTime()
+        lastTick = startedAt
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func cancel() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func tick() {
+        guard timer != nil else { return }
+        let now = CACurrentMediaTime()
+        let gap = now - lastTick
+        maxGap = max(maxGap, gap)
+        ticks += 1
+        if gap > frameInterval * 2.5 { dropped += 1 }
+        let dt = min(max(gap, 1.0 / 240.0), 1.0 / 30.0)
+        lastTick = now
+        // a = -2ζωv - ω²(x - 1)：标准弹簧 + 阻尼，目标点取 1
+        velocity += (-2 * zeta * omega * velocity - omega * omega * (value - 1)) * dt
+        value += velocity * dt
+        if abs(value - 1) < 0.003 && abs(velocity) < 0.05 {
+            cancel()
+            morphLog("morph(\(label)) 完成: 帧数=\(ticks) 丢帧=\(dropped) "
+                     + "用时=\(String(format: "%.2f", now - startedAt))s "
+                     + "最大帧间隔=\(Int(maxGap * 1000))ms（目标 \(Int(frameInterval * 1000))ms）"
+                     + (dropped > 2 ? " ← 卡顿偏多，动画看着会顿" : ""))
+            onStep(1, true)     // 收尾：调用方把 frame 摆到精确的目标值
+            return
+        }
+        onStep(value, false)
     }
 }
 
 // MARK: - 面板控制器
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var window: NSWindow!
+    // 面板
+    private var panel: IslandPanel!
+    private var container: HoverView!
+    private var blur: NSVisualEffectView!
+    private var header: NSView!
+    private var capsuleStack: NSStackView!
+    private var capsuleBadge: NSView!
+    private var capsuleLabel: NSTextField!
+    private var titleLabel: NSTextField!
+    private var controlsStack: NSStackView!
+    private var detail: NSView!
+    private var scrollView: NSScrollView!
     private var cardGrid: CardGridView!
     private var emptyLabel: NSTextField!
-    private var countLabel: NSTextField!
     private var statusLabel: NSTextField!
-    private var refreshButton: NSButton!
     private var authBanner: NSButton!
     private var authBannerHeight: NSLayoutConstraint!
     private var pinButton: NSButton!
-    private var isPinned = false
-    private let pinKey = "panelAlwaysOnTop"
+    private var recorder: HotKeyRecorder!
+    private var expandedOnly: [NSView] = []
+    /// 头部高度约束（折叠成"假刘海"时要压到菜单栏那么高）
+    private var headerHeightConstraint: NSLayoutConstraint!
+    /// 展开态里"按住能拖面板"的视图（标题栏的空白与标题、胶囊内容）
+    private var dragHandleViews: [NSView] = []
 
-    private var apps: [NSRunningApplication] = []
-    private var lastSignature: [String] = []
-    private var reloadCounter = 0
+    // 菜单栏
+    private var statusItem: NSStatusItem!
+
+    // 状态
+    private var isExpanded = false
+    private var isPinned = false
+    private var lastScreenID: UInt32 = 0
+    private var screenWatchTimer: Timer?
+    private var collapseWork: DispatchWorkItem?
+    /// 展开态：只看鼠标真实坐标决定收不收（控件进出事件在窗口动画期间会抖）
+    private var hoverPollTimer: Timer?
+    /// 展开那一刻的折叠命中区（刘海那一带算在里面）
+    private var collapsedHitRect: NSRect = .zero
+    /// 收起时鼠标还赖在命中区里 → 先不忙重开，等它挪开
+    private var reopenBlocked = false
+    private var reopenGuardWork: DispatchWorkItem?
+    private var reopenWatchTimer: Timer?
+    /// 拖动中
+    private var isDraggingIsland = false
+    /// 本次拖动累计移动了多少（用来区分"真拖动"和"只是点了一下"）
+    private var dragAccumulated: CGFloat = 0
+    /// 自测/调试用：假装鼠标在某个位置（这个环境里拿不到真实鼠标事件）
+    private var fakeCursor: NSPoint?
+    private var capsuleNoticeWork: DispatchWorkItem?
     private var refreshTimer: Timer?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var statusResetItem: DispatchWorkItem?
+    private var keyMonitor: Any?
 
-    private let defaultStatus = "✕ 彻底关闭应用 · 点窗口卡片打开/关单个窗口 · 📌 置顶"
+    private var apps: [NSRunningApplication] = []
+    private var appCount = 0
+    private var lastSignature: [String] = []
+    private var reloadCounter = 0
+
+    // 快捷键
+    private let hotKey = HotKeyManager()
+    private var hotKeyCode = Int(kVK_ANSI_K)
+    private var hotKeyMods = Int(cmdKey | optionKey)
+    private var hotKeyLabel = "⌥⌘K"
+
+    // 偏好
+    private let pinKey = "panelAlwaysOnTop"
+    private let islandKey = "showIslandCapsule"
+    private let hidesInNotchKey = "hideCapsuleInNotch"
+    /// 被拖动后面板的**绝对位置**（Cocoa 屏幕坐标下的左上角）。**只在这一次展开期间有效**：
+    /// 不落盘、不按屏幕记忆，每次 `expand` 都清空 —— 用户要的行为就是"打开就在初始位置"。
+    ///
+    /// ⚠️ 存绝对坐标而不是"相对当前屏中心的偏移"，是因为偏移得配一个基准，
+    /// 而基准是 `currentScreen()`（看鼠标在哪块屏）。鼠标一跨屏，基准整块跳掉，
+    /// 面板就会瞬间平移到另一块屏的"对应位置"——大屏右侧一拖到小屏，就闪到小屏右侧去了。
+    private var draggedTopLeft: NSPoint?
+    /// 正在跑的展开/收起动画。同一时刻只允许一个：新动画会取消旧的，并从当前帧接着走
+    /// （所以"展开到一半又收起"不会跳，只会顺着当前速度拐回去）
+    private var morphDriver: SpringDriver?
+    /// 这一轮动画采样要落到的目标帧（自测用，开跑时定下来）
+    private var morphTarget: NSRect?
+    /// 展开动画的帧采样（只有自测用，看轨迹顺不顺、有没有跳帧）
+    private var morphTrack: [NSRect] = []
+    /// 动画期间被推迟的 reload
+    private var deferredReload: DispatchWorkItem?
+    /// 旧版把位置按屏幕存成 UserDefaults（`islandPositionOffsets`）。启动时清一次，
+    /// 免得老用户升级后留下一份谁也不读的数据。
+    private let legacyPositionKey = "islandPositionOffsets"
+    private let hotKeyCodeKey = "hotKeyCode"
+    private let hotKeyModsKey = "hotKeyModifiers"
+    private let hotKeyLabelKey = "hotKeyLabel"
+
+    private let defaultStatus = "✕ 彻底关闭应用 · 点卡片激活 · 鼠标移开自动收起"
+
+    private let debugEnabled = ProcessInfo.processInfo.environment["CLOSEAPPS_DEBUG"] != nil
+    private let selfTestEnabled = ProcessInfo.processInfo.environment["CLOSEAPPS_SELFTEST"] != nil
+    private func dbg(_ message: String) {
+        guard debugEnabled else { return }
+        FileHandle.standardError.write(Data(("[closeapps] " + message + "\n").utf8))
+    }
+
+    private func dumpState(_ tag: String) {
+        guard debugEnabled else { return }
+        dbg("state[\(tag)]: expanded=\(isExpanded) pinned=\(isPinned) apps=\(appCount) "
+            + "trusted=\(axTrusted()) frame=\(panel.frame) detailAlpha=\(detail.alphaValue) "
+            + "visible=\(panel.isVisible) cards=\(cardGrid.subviews.count) "
+            + "loginItem=\(LoginItem.isEnabled) hotkey=\(hotKeyLabel) "
+            + "notch=\(currentScreen().notchRect.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" } ?? "无") "
+            + "藏刘海=\(hidesInNotchNow(on: currentScreen())) 容器alpha=\(container?.alphaValue ?? -1) 阴影=\(panel?.hasShadow ?? false) "
+            + "拖动=\(offsetText()) 重开锁=\(reopenBlocked) 命中区=\(rectText(collapsedHitRect)) "
+            + "样式=\(collapsedStyle(on: currentScreen())) 菜单栏高=\(Int(currentScreen().menuBarHeight)) "
+            + "折叠框=\(rectText(islandFrame(expanded: false))) 展开框=\(rectText(islandFrame(expanded: true)))")
+    }
+
+    /// 仅调试（stdin 指令 `mask`）：把假刘海的遮罩真的算出来、导出成 PNG、再探四个角的像素。
+    /// 形状这事嘴上说不清 —— 直角还是圆角、圆角多大，直接看图 + 报数。
+    private func dumpMask() {
+        let screen = currentScreen()
+        let scale = screen.backingScaleFactor
+        let size = NSSize(width: Cfg.capsuleWidth, height: capsuleBarHeight(on: screen))
+        let installed = blur?.maskImage?.size ?? .zero
+        dbg("mask: 屏幕=\(screen.localizedName) 有刘海=\(screen.notchRect != nil) 刻度=\(scale)x 折叠样式=\(collapsedStyle(on: screen))")
+        dbg("mask: 现值=\(Int(installed.width))x\(Int(installed.height)) 待验=\(Int(size.width))x\(Int(size.height)) 圆角=\(Cfg.fakeNotchRadius)")
+
+        let image = Self.notchMask(size: size, radius: Cfg.fakeNotchRadius, scale: scale)
+        guard let rep = image.representations.first as? NSBitmapImageRep else {
+            dbg("mask: 拿不到位图，导出失败")
+            return
+        }
+        let w = rep.pixelsWide, h = rep.pixelsHigh
+        // NSBitmapImageRep 的 y=0 是图像最上面那一行
+        func alpha(_ x: Int, _ y: Int) -> Int {
+            let c = rep.colorAt(x: min(max(x, 0), w - 1), y: min(max(y, 0), h - 1))
+            return Int(((c?.alphaComponent ?? 0) * 255).rounded())
+        }
+        dbg("mask: \(w)x\(h)px 上缘中点=\(alpha(w / 2, 0)) 左上角=\(alpha(0, 0)) 右上角=\(alpha(w - 1, 0)) "
+            + "下缘中点=\(alpha(w / 2, h - 1)) 左下角=\(alpha(0, h - 1)) 右下角=\(alpha(w - 1, h - 1))")
+        var gap = -1
+        for x in 0..<w where alpha(x, h - 1) > 128 { gap = x; break }
+        dbg("mask: 下缘左侧留白=\(gap)px（圆角 \(Cfg.fakeNotchRadius)pt × 刻度 \(scale) = \(Int(Cfg.fakeNotchRadius * scale))px）")
+        if let data = rep.representation(using: .png, properties: [:]) {
+            let path = "/tmp/closeapps-mask.png"
+            try? data.write(to: URL(fileURLWithPath: path))
+            dbg("mask: 已导出 \(path)")
+        }
+        // 再验一张"能逐帧重做的小图"：展开/收起动画里用的就是它（四角半径可以不一样，
+        // 这里按"假刘海"的参数出图：上缘直角 + 下缘 16 圆角）
+        let stretch = Self.panelMask(topRadius: 0, bottomRadius: Cfg.fakeNotchRadius)
+        var proposed = NSRect(origin: .zero, size: stretch.size)
+        if let cg = stretch.cgImage(forProposedRect: &proposed, context: nil, hints: nil) {
+            let rep2 = NSBitmapImageRep(cgImage: cg)
+            let w2 = rep2.pixelsWide, h2 = rep2.pixelsHigh
+            func alpha2(_ x: Int, _ y: Int) -> Int {
+                let c = rep2.colorAt(x: min(max(x, 0), w2 - 1), y: min(max(y, 0), h2 - 1))
+                return Int(((c?.alphaComponent ?? 0) * 255).rounded())
+            }
+            dbg("mask(小图/动画用): \(w2)x\(h2)px 上缘中点=\(alpha2(w2 / 2, 0)) 左上角=\(alpha2(0, 0)) "
+                + "右上角=\(alpha2(w2 - 1, 0)) 下缘中点=\(alpha2(w2 / 2, h2 - 1)) "
+                + "左下角=\(alpha2(0, h2 - 1)) 右下角=\(alpha2(w2 - 1, h2 - 1))")
+            if let data2 = rep2.representation(using: .png, properties: [:]) {
+                let path2 = "/tmp/closeapps-panelmask.png"
+                try? data2.write(to: URL(fileURLWithPath: path2))
+                dbg("mask: 已导出 \(path2)")
+            }
+        } else {
+            dbg("mask: 小图渲染失败（panelMask 出图有问题）")
+        }
+
+        // 再出一张 2x 的：形状和上边那张是同一个函数算的，只是给预览图用，贴到 2 倍画布上不糊
+        let big = Self.notchMask(size: size, radius: Cfg.fakeNotchRadius, scale: 2)
+        if let bigRep = big.representations.first as? NSBitmapImageRep,
+           let data = bigRep.representation(using: .png, properties: [:]) {
+            let path = "/tmp/closeapps-mask@2x.png"
+            try? data.write(to: URL(fileURLWithPath: path))
+            dbg("mask: 已导出 \(path)（\(bigRep.pixelsWide)x\(bigRep.pixelsHigh)px，给预览用）")
+        }
+
+        // 再来一张"关掉藏进刘海时那枚胶囊"的（176×36）：同一个 0/16 形状，只是条高不一样
+        let capSize = NSSize(width: Cfg.capsuleWidth, height: Cfg.capsuleSize.height)
+        let cap = Self.notchMask(size: capSize, radius: Cfg.fakeNotchRadius, scale: 2)
+        if let capRep = cap.representations.first as? NSBitmapImageRep,
+           let data = capRep.representation(using: .png, properties: [:]) {
+            let path = "/tmp/closeapps-capsule@2x.png"
+            try? data.write(to: URL(fileURLWithPath: path))
+            dbg("mask: 已导出 \(path)（\(capRep.pixelsWide)x\(capRep.pixelsHigh)px = 胶囊 "
+                + "\(Int(capSize.width))x\(Int(capSize.height))）")
+        }
+    }
+
+    /// 仅调试模式（CLOSEAPPS_SELFTEST=1）：内置时序，自测展开/收起/开关，
+    /// 最后调 NSApp.terminate 验证退出链路。不需要任何外部交互。
+    private func runSelfTest() {
+        guard selfTestEnabled else { return }
+        // 这个环境拿不到真实鼠标事件，所以自测统一"注入假坐标 + 走真实判定函数"，
+        // 验的就是 expand / collapse / 轮询 / 重开锁 / 拖动这条链路本身。
+        let place: (NSPoint) -> () -> Void = { point in
+            { [weak self] in self?.fakeCursor = point }
+        }
+        let script: [(String, TimeInterval, () -> Void)] = [
+            ("dump@① 启动初始态", 0.35, { [weak self] in self?.dumpState("① 启动初始态") }),
+
+            // ① 悬停 → 展开（走真实的 mouseEnteredIsland，坐标核验也在里面）
+            ("假光标=胶囊中心", 0.60, { [weak self] in self?.fakeCursor = self?.capsuleCenter() }),
+            ("hover-enter", 0.70, { [weak self] in self?.mouseEnteredIsland() }),
+            ("dump@② 悬停展开", 1.10, { [weak self] in self?.dumpState("② 悬停展开") }),
+
+            // ② ★问题1 回归：光标停在"刘海那一带"（在命中区里、却在展开面板之外）1.5s，不该收起
+            ("假光标=刘海那一带", 1.30, { [weak self] in
+                self?.fakeCursor = self?.hoverGraceProbe()
+                self?.dbg("grace probe = \(self?.fakeCursor ?? .zero)")
+            }),
+            ("dump@③ 停在那儿 1.5s（应仍展开）", 2.80, { [weak self] in self?.dumpState("③ 停在那儿 1.5s") }),
+
+            // ③ 真移开 → 自动收起
+            ("假光标=远处", 3.00, place(NSPoint(x: 120, y: 300))),
+            ("dump@④ 移开后（应已收起）", 3.90, { [weak self] in self?.dumpState("④ 移开后") }),
+
+            // ④ ★问题2 回归：移开后马上再 hover，不该被时间窗挡住
+            ("假光标=胶囊中心", 4.05, { [weak self] in self?.fakeCursor = self?.capsuleCenter() }),
+            ("hover-enter（连续 hover）", 4.15, { [weak self] in self?.mouseEnteredIsland() }),
+            ("dump@⑤ 连续 hover 再展开", 4.65, { [weak self] in self?.dumpState("⑤ 连续 hover 再展开") }),
+
+            // ⑤ 光标没动时收起 → 加锁；挪开再回来才放行
+            ("toggle（光标还在命中区）", 4.95, { [weak self] in self?.toggleFromKeyboard() }),
+            ("hover-enter（应被拦）", 5.25, { [weak self] in self?.mouseEnteredIsland() }),
+            ("dump@⑥ 没离开时重开被拦", 5.65, { [weak self] in self?.dumpState("⑥ 重开被拦") }),
+            ("假光标=远处", 5.85, place(NSPoint(x: 120, y: 300))),
+            ("假光标=回胶囊中心", 6.35, { [weak self] in self?.fakeCursor = self?.capsuleCenter() }),
+            ("hover-enter（应放行）", 6.45, { [weak self] in self?.mouseEnteredIsland() }),
+            ("dump@⑦ 挪开后重开成功", 6.95, { [weak self] in self?.dumpState("⑦ 挪开后重开成功") }),
+
+            // ⑥ 拖动 + 重置位置
+            ("collapse", 7.20, { [weak self] in self?.collapse(animated: false) }),
+            ("drag +120,-60", 7.60, { [weak self] in self?.simulateDrag(dx: 120, dy: -60) }),
+            ("check 胶囊没被拖走", 7.90, { [weak self] in self?.probeCapsulePinned() }),
+            ("check 面板滚区形状（收起态）", 7.45, { [weak self] in self?.probeCapsuleShape() }),
+            ("dump@⑧ 拖动后", 8.10, { [weak self] in self?.dumpState("⑧ 拖动后") }),
+            ("resetpos", 8.40, { [weak self] in self?.resetIslandPosition() }),
+            ("dump@⑨ 重置后", 8.90, { [weak self] in self?.dumpState("⑨ 重置后") }),
+
+            // ⑦ 开机启动 / 藏刘海开关
+            // ★ 只读：以前这里真的开关一遍开机项，等于把开机项重挂到"当时跑的那份副本"上
+            ("check 开机启动（只读）", 9.20, { [weak self] in self?.probeLoginItem() }),
+            ("dump@⑪ 开机启动态", 9.60, { [weak self] in self?.dumpState("⑪ 开机启动态") }),
+            ("notch-off", 12.20, { [weak self] in self?.menuToggleHidesInNotch() }),
+            ("dump@⑫ 不藏刘海（贴顶胶囊）", 12.80, { [weak self] in self?.dumpState("⑫ 不藏刘海") }),
+            ("check 胶囊形状（关掉藏刘海那态）", 12.95, { [weak self] in self?.probeCapsuleShape() }),
+            ("notch-on", 13.10, { [weak self] in self?.menuToggleHidesInNotch() }),
+            ("dump@⑬ 恢复藏刘海", 13.70, { [weak self] in self?.dumpState("⑬ 恢复藏刘海") }),
+
+            // ⑧ ★「面板拖不动」回归：展开态按住标题栏也要能拖。
+            //    以前 hover 一上来就展开，按下时 isExpanded 早已为 true，被 guard 吞掉 → 永远拖不动。
+            //    这里走非激活展开：快捷键展开会先激活 App，动画得等激活完才起步，日志会看着像"没动"
+            ("expand", 13.85, { [weak self] in self?.expand(activateApp: false) }),
+            ("track 展开动画", 13.90, { [weak self] in self?.trackMorphMotion("展开") }),
+            ("假光标=展开面板中心", 14.15, { [weak self] in
+                guard let self else { return }
+                self.fakeCursor = NSPoint(x: self.panel.frame.midX, y: self.panel.frame.midY)
+            }),
+            ("dump@⑭ 展开态", 14.45, { [weak self] in self?.dumpState("⑭ 展开态") }),
+            // 右上角按钮必须点得到（不能被拖动把手抢走）
+            // 放到 15.10：这之前面板必须已经长到最终尺寸，否则量的是动画中途的容器
+            ("hit-test 右上角按钮", 15.10, { [weak self] in self?.probeHeaderHitTest() }),
+            // ★ 滚动条要展开着量：收起时滚动区根本没布局
+            ("check 滚动条宽度", 15.08, { [weak self] in self?.probeScroller() }),
+            ("drag(展开态) +80,-70", 14.65, { [weak self] in self?.simulateDrag(dx: 80, dy: -70) }),
+            ("假光标=跟到新位置", 14.95, { [weak self] in
+                guard let self else { return }
+                self.fakeCursor = NSPoint(x: self.panel.frame.midX, y: self.panel.frame.midY)
+            }),
+            ("dump@⑮ 展开态拖动后", 15.15, { [weak self] in self?.dumpState("⑮ 展开态拖动后") }),
+            ("check 跨屏拖动不跳", 15.25, { [weak self] in self?.probeCrossScreenDrag() }),
+            // ★ 「打开就回初始位置」回归：拖开之后收起，再打开必须回到默认框
+            ("collapse（准备验重开）", 15.35, { [weak self] in self?.collapse(animated: false) }),
+            ("check 假刘海形状（无刘海屏）", 15.42, { [weak self] in self?.probeFakeNotchShape() }),
+            ("expand（重开）", 15.60, { [weak self] in self?.expand(activateApp: false) }),
+            ("check 重开是否回初始位置", 16.10, { [weak self] in self?.probeExpandResetsPosition() }),
+            ("dump@⑯ 重开后（应回初始位置）", 16.25, { [weak self] in self?.dumpState("⑯ 重开后") }),
+            ("quit", 17.10, { [weak self] in
+                self?.dbg("selftest: 调用 NSApp.terminate")
+                NSApp.terminate(nil)
+                self?.dbg("selftest: terminate 返回了但进程没退出 ← 问题在这")
+            }),
+        ]
+        for (name, delay, action) in script {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                self.dbg("selftest step: \(name)")
+                action()
+            }
+        }
+    }
+
+    /// 仅调试模式（CLOSEAPPS_DEBUG=1）：从 stdin 收指令驱动面板，方便在没有鼠标事件的
+    /// 环境里（自动化测试、远程会话）验证展开/收起状态机。普通使用完全不会走到这里。
+    private func startDebugConsole() {
+        guard debugEnabled, !selfTestEnabled else { return }
+        DispatchQueue.global(qos: .utility).async {
+            while let raw = readLine(strippingNewline: true) {
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty else { continue }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if line.hasPrefix("mouse ") {
+                        self.debugSetFakeCursor(String(line.dropFirst(6)))
+                        return
+                    }
+                    if line.hasPrefix("drag ") {
+                        let parts = line.dropFirst(5).split(separator: " ").compactMap { Double($0) }
+                        guard parts.count == 2 else { self.dbg("usage: drag <dx> <dy>"); return }
+                        self.simulateDrag(dx: CGFloat(parts[0]), dy: CGFloat(parts[1]))
+                        return
+                    }
+                    switch line {
+                    case "hover-enter": self.mouseEnteredIsland()
+                    case "resetpos": self.resetIslandPosition()
+                    case "hover-exit": self.mouseExitedIsland()
+                    case "expand": self.expand(activateApp: false)
+                    case "expand-key": self.expand(activateApp: true)
+                    case "collapse": self.collapse(animated: true)
+                    case "toggle": self.toggleFromKeyboard()
+                    case "pin": self.togglePin()
+                    case "island": self.menuToggleIsland()
+                    case "notch": self.menuToggleHidesInNotch()
+                    case "login": self.menuToggleLoginItem()
+                    case "dump": self.dumpState("dump")
+                    case "mask": self.dumpMask()
+                    case "shape":
+                        self.probeCapsuleShape()
+                        self.probeScroller()
+                    case "quit":
+                        self.dbg("quit: calling NSApp.terminate")
+                        NSApp.terminate(nil)
+                        self.dbg("quit: terminate returned (did not exit)")
+                    case "quit-now":
+                        self.dbg("quit-now: exit(0)")
+                        exit(0)
+                    default: self.dbg("unknown command: \(line)")
+                    }
+                }
+            }
+            self.dbg("stdin 已关闭，调试控制台停止读取")
+        }
+    }
+
+    /// 调试/自测用：注入假的光标位置（`mouse 756 491` / `mouse clear`）。
+    /// 这个环境里投递鼠标事件会被系统权限挡掉，只能这样验坐标判定逻辑。
+    private func debugSetFakeCursor(_ arg: String) {
+        let text = arg.trimmingCharacters(in: .whitespaces)
+        if text.isEmpty || text == "clear" {
+            fakeCursor = nil
+            dbg("假光标已清除（回到真实位置）")
+            return
+        }
+        let parts = text.split(separator: " ").compactMap { Double($0) }
+        guard parts.count == 2 else {
+            dbg("usage: mouse <x> <y> | mouse clear")
+            return
+        }
+        fakeCursor = NSPoint(x: parts[0], y: parts[1])
+        dbg("假光标 -> \(Int(parts[0])),\(Int(parts[1])) 屏=\(currentScreen().displayID)")
+    }
 
     // MARK: 生命周期
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        buildUI()
-        setPinned(UserDefaults.standard.bool(forKey: pinKey), silent: true)
-        reload(force: true)
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+    }
 
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.reload()
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if UserDefaults.standard.object(forKey: islandKey) == nil {
+            UserDefaults.standard.set(true, forKey: islandKey)
         }
+        if UserDefaults.standard.object(forKey: hidesInNotchKey) == nil {
+            UserDefaults.standard.set(true, forKey: hidesInNotchKey)
+        }
+        // 位置从 v1.6 起不缓存了，把旧版存的那份清掉
+        dropLegacyPositionMemory()
+        buildPanel()
+        buildStatusItem()
+        setupHotKey()
+        isPinned = UserDefaults.standard.bool(forKey: pinKey)
+        applyPinAppearance()
+        updateCounts()
+        applyIslandVisibility()
+        dbg("launched: screen=\(currentScreen().frame) visible=\(currentScreen().visibleFrame) capsule=\(islandFrame(expanded: false))")
+        startDebugConsole()
+        runSelfTest()
+        lastScreenID = currentScreen().displayID
+        screenWatchTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.followMouseScreen()
+        }
+
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(center.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.reload() })
+        ) { [weak self] _ in self?.refreshLightweight() })
         workspaceObservers.append(center.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.reload() })
+        ) { [weak self] _ in self?.refreshLightweight() })
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+
+        // 展开状态下按 Esc 收起
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            if event.keyCode == 53, self.isExpanded, !self.recorder.isRecording {
+                self.collapse(animated: true)
+                return nil
+            }
+            return event
+        }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        dbg("applicationShouldTerminate -> terminateNow")
+        return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        dbg("applicationWillTerminate")
         refreshTimer?.invalidate()
+        screenWatchTimer?.invalidate()
+        stopHoverPoll()
+        reopenWatchTimer?.invalidate()
+        reopenWatchTimer = nil
+        hotKey.unregister()
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.forEach { center.removeObserver($0) }
+        NotificationCenter.default.removeObserver(self)
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// 常驻：面板关掉也不退出应用
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     // MARK: 界面搭建
 
-    private func buildUI() {
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 596, height: 680),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        win.title = "应用关闭面板"
-        win.minSize = NSSize(width: 360, height: 480)
-        win.isOpaque = false
-        win.backgroundColor = .clear
-        win.titlebarAppearsTransparent = true
-        win.titleVisibility = .hidden
-        win.isMovableByWindowBackground = true
-        win.center()
-        window = win
+    private func buildPanel() {
+        let p = IslandPanel(contentRect: islandFrame(expanded: false),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered,
+                            defer: false)
+        p.level = .statusBar
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.hidesOnDeactivate = false
+        p.isMovable = false
+        p.isReleasedWhenClosed = false
+        p.animationBehavior = .none
+        p.becomesKeyOnlyIfNeeded = false
+        p.title = "应用关闭面板"
+        panel = p
 
-        let blur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 596, height: 680))
-        blur.material = .underWindowBackground
-        blur.blendingMode = .behindWindow
-        blur.state = .active
-        blur.autoresizingMask = [.width, .height]
-        win.contentView = blur
-        let content = blur
+        let hover = HoverView(frame: NSRect(origin: .zero, size: Cfg.capsuleSize))
+        hover.wantsLayer = true
+        hover.layer?.masksToBounds = true
+        hover.layer?.cornerRadius = Cfg.cornerRadius
+        hover.onEnter = { [weak self] in self?.mouseEnteredIsland() }
+        hover.onExit = { [weak self] in self?.mouseExitedIsland() }
+        hover.onDragBegin = { [weak self] in self?.beginIslandDrag() }
+        hover.onDrag = { [weak self] dx, dy in self?.dragIslandBy(dx: dx, dy: dy) }
+        hover.onDragEnd = { [weak self] in self?.endIslandDrag() }
+        hover.shouldCaptureMouse = { [weak self] hitView, _ in
+            guard let self else { return false }
+            return self.shouldCaptureMouseForDrag(hitView: hitView)
+        }
+        container = hover
+        p.contentView = hover
 
-        countLabel = NSTextField(labelWithString: "正在运行的应用")
-        countLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        countLabel.translatesAutoresizingMaskIntoConstraints = false
+        let effect = NSVisualEffectView(frame: hover.bounds)
+        effect.material = .underWindowBackground
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.autoresizingMask = [.width, .height]
+        effect.maskImage = Self.roundedMask(radius: Cfg.cornerRadius)
+        hover.addSubview(effect)
+        blur = effect
 
-        refreshButton = NSButton(title: "刷新", target: self, action: #selector(manualRefresh))
-        refreshButton.bezelStyle = .rounded
-        refreshButton.controlSize = .small
-        refreshButton.translatesAutoresizingMaskIntoConstraints = false
+        buildHeader()
+        buildDetail()
 
-        pinButton = NSButton()
-        pinButton.image = NSImage(systemSymbolName: "pin", accessibilityDescription: "置顶")?
-            .withSymbolConfiguration(.init(pointSize: 14, weight: .medium))
-        pinButton.isBordered = false
-        pinButton.contentTintColor = .secondaryLabelColor
-        pinButton.target = self
-        pinButton.action = #selector(togglePin)
-        pinButton.toolTip = "面板置顶（始终显示在最前）"
-        pinButton.setAccessibilityLabel("面板置顶")
-        pinButton.translatesAutoresizingMaskIntoConstraints = false
+        p.setFrame(islandFrame(expanded: false), display: false)
+    }
+
+    /// 头部：固定 596 宽、水平居中，窗口变窄时被裁掉两侧——只剩中间那枚胶囊
+    private func buildHeader() {
+        let h = NSView(frame: .zero)
+        h.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(h)
+        header = h
+        let hHeight = h.heightAnchor.constraint(equalToConstant: Cfg.headerHeight)
+        headerHeightConstraint = hHeight
+        dragHandleViews.append(h)
+        NSLayoutConstraint.activate([
+            h.topAnchor.constraint(equalTo: container.topAnchor),
+            h.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            h.widthAnchor.constraint(equalToConstant: Cfg.expandedSize.width),
+            hHeight,
+        ])
+
+        // 折叠态胶囊内容（居中于面板正中，展开时淡出）
+        let icon = NSImageView(image: NSApp.applicationIconImage)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+
+        let label = NSTextField(labelWithString: "正在运行")
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byClipping
+        label.translatesAutoresizingMaskIntoConstraints = false
+        capsuleLabel = label
+
+        let badge = NSView(frame: .zero)
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.systemOrange.cgColor
+        badge.layer?.cornerRadius = 4
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        badge.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        badge.isHidden = true
+        badge.toolTip = "还没授权「辅助功能」，看不到窗口列表"
+        capsuleBadge = badge
+
+        let stack = NSStackView(views: [icon, label, badge])
+        stack.orientation = .horizontal
+        stack.spacing = 6
+        stack.alignment = .centerY
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        h.addSubview(stack)
+        capsuleStack = stack
+        dragHandleViews.append(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: h.centerYAnchor),
+        ])
+
+        // 展开态标题（居左）
+        let title = NSTextField(labelWithString: "正在运行的应用")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        h.addSubview(title)
+        titleLabel = title
+        dragHandleViews.append(title)
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: h.leadingAnchor, constant: 16),
+            title.centerYAnchor.constraint(equalTo: h.centerYAnchor),
+        ])
+
+        // 展开态控件（居右）
+        let rec = HotKeyRecorder()
+        rec.translatesAutoresizingMaskIntoConstraints = false
+        rec.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        rec.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        rec.onClick = { [weak self] in self?.beginRecordingHotKey() }
+        rec.onCancel = { [weak self] in self?.finishRecordingHotKey() }
+        rec.onCapture = { [weak self] code, mods, label in
+            self?.applyHotKey(code: Int(code), mods: Int(mods), label: label)
+            self?.finishRecordingHotKey()
+        }
+        recorder = rec
+
+        let pin = NSButton()
+        pin.image = NSImage(systemSymbolName: "pin", accessibilityDescription: "置顶")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
+        pin.isBordered = false
+        pin.contentTintColor = .secondaryLabelColor
+        pin.target = self
+        pin.action = #selector(togglePin)
+        pin.toolTip = "钉住面板（鼠标移开也不收起）"
+        pin.setAccessibilityLabel("钉住面板")
+        pin.translatesAutoresizingMaskIntoConstraints = false
+        pin.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        pin.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        pinButton = pin
+
+        let refresh = NSButton()
+        refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "刷新")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
+        refresh.isBordered = false
+        refresh.contentTintColor = .secondaryLabelColor
+        refresh.target = self
+        refresh.action = #selector(manualRefresh)
+        refresh.toolTip = "立即刷新"
+        refresh.setAccessibilityLabel("刷新")
+        refresh.translatesAutoresizingMaskIntoConstraints = false
+        refresh.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        refresh.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        let collapseButton = NSButton()
+        collapseButton.image = NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "收起")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
+        collapseButton.isBordered = false
+        collapseButton.contentTintColor = .secondaryLabelColor
+        collapseButton.target = self
+        collapseButton.action = #selector(collapseNow)
+        collapseButton.toolTip = "收起面板（Esc）"
+        collapseButton.setAccessibilityLabel("收起面板")
+        collapseButton.translatesAutoresizingMaskIntoConstraints = false
+        collapseButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        collapseButton.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        let controls = NSStackView(views: [rec, pin, refresh, collapseButton])
+        controls.orientation = .horizontal
+        controls.spacing = 8
+        controls.alignment = .centerY
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        h.addSubview(controls)
+        controlsStack = controls
+        NSLayoutConstraint.activate([
+            controls.trailingAnchor.constraint(equalTo: h.trailingAnchor, constant: -14),
+            controls.centerYAnchor.constraint(equalTo: h.centerYAnchor),
+        ])
+
+        expandedOnly = [title, controls]
+        expandedOnly.forEach { $0.alphaValue = 0 }
+    }
+
+    /// 详情区：固定 596 宽、挂在头部下方，折叠时整体被容器裁掉
+    private func buildDetail() {
+        let d = NSView(frame: .zero)
+        d.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(d)
+        detail = d
+        NSLayoutConstraint.activate([
+            d.topAnchor.constraint(equalTo: container.topAnchor, constant: Cfg.headerHeight),
+            d.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            d.widthAnchor.constraint(equalToConstant: Cfg.expandedSize.width),
+            d.heightAnchor.constraint(equalToConstant: Cfg.detailSize.height),
+        ])
 
         authBanner = NSButton(
             title: "打开「系统设置 › 隐私与安全性 › 辅助功能」，勾选 CloseApps 以显示窗口列表 →",
@@ -506,21 +1585,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         authBanner.alignment = .center
         authBanner.translatesAutoresizingMaskIntoConstraints = false
 
-        statusLabel = NSTextField(labelWithString: defaultStatus)
-        statusLabel.font = .systemFont(ofSize: 12)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-
         cardGrid = CardGridView(frame: .zero)
         cardGrid.translatesAutoresizingMaskIntoConstraints = false
 
-        let scrollView = NSScrollView()
-        scrollView.documentView = cardGrid
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = false
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        let scroll = NSScrollView()
+        scroll.documentView = cardGrid
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.verticalScroller = ThinScroller()      // 细一号（见 ThinScroller）
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scrollView = scroll
 
         emptyLabel = NSTextField(labelWithString: "没有正在运行的应用")
         emptyLabel.font = .systemFont(ofSize: 14)
@@ -528,51 +1603,1211 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
         emptyLabel.isHidden = true
 
-        content.addSubview(countLabel)
-        content.addSubview(refreshButton)
-        content.addSubview(pinButton)
-        content.addSubview(authBanner)
-        content.addSubview(scrollView)
-        content.addSubview(emptyLabel)
-        content.addSubview(statusLabel)
+        statusLabel = NSTextField(labelWithString: defaultStatus)
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        d.addSubview(authBanner)
+        d.addSubview(scroll)
+        d.addSubview(emptyLabel)
+        d.addSubview(statusLabel)
 
         authBannerHeight = authBanner.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
-            countLabel.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor, constant: 8),
-            countLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
-
-            refreshButton.centerYAnchor.constraint(equalTo: countLabel.centerYAnchor),
-            refreshButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
-
-            pinButton.centerYAnchor.constraint(equalTo: refreshButton.centerYAnchor),
-            pinButton.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -10),
-            pinButton.widthAnchor.constraint(equalToConstant: 26),
-            pinButton.heightAnchor.constraint(equalToConstant: 24),
-
-            authBanner.topAnchor.constraint(equalTo: countLabel.bottomAnchor, constant: 4),
-            authBanner.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
-            authBanner.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            authBanner.topAnchor.constraint(equalTo: d.topAnchor, constant: 4),
+            authBanner.leadingAnchor.constraint(equalTo: d.leadingAnchor, constant: 18),
+            authBanner.trailingAnchor.constraint(equalTo: d.trailingAnchor, constant: -18),
             authBannerHeight,
 
-            scrollView.topAnchor.constraint(equalTo: authBanner.bottomAnchor, constant: 6),
-            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            scrollView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -10),
+            scroll.topAnchor.constraint(equalTo: authBanner.bottomAnchor, constant: 6),
+            scroll.leadingAnchor.constraint(equalTo: d.leadingAnchor, constant: 16),
+            scroll.trailingAnchor.constraint(equalTo: d.trailingAnchor, constant: -16),
+            scroll.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -6),
 
-            cardGrid.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            cardGrid.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            cardGrid.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            cardGrid.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
 
-            emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            emptyLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+            emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
 
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -18),
-            statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            statusLabel.leadingAnchor.constraint(equalTo: d.leadingAnchor, constant: 18),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: d.trailingAnchor, constant: -18),
+            statusLabel.bottomAnchor.constraint(equalTo: d.bottomAnchor, constant: -10),
         ])
+        detail.alphaValue = 0
+    }
 
-        win.makeKeyAndOrderFront(nil)
+    /// 假刘海的遮罩：上缘两个直角（贴着屏幕顶沿），下缘两角是普通圆角 —— 就一行 CSS：
+    /// `border-radius: 0 0 16px 16px`。有刘海的屏上那块是物理盲区，这里没有，
+    /// 只能"画"出一块来，让用户平白多一块刘海。
+    ///
+    /// 这张图按**真实尺寸**出（不是像 roundedMask 那样出小图 + capInsets 拉伸）：
+    /// 圆角 16 而条高只有二十几点，四边 inset 加起来会超过图高，拉伸会退化成一坨。
+    private static func notchMask(size: NSSize, radius: CGFloat, scale: CGFloat) -> NSImage {
+        let image = NSImage(size: size)
+        let w = max(1, Int((size.width * scale).rounded()))
+        let h = max(1, Int((size.height * scale).rounded()))
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: w, pixelsHigh: h,
+                                         bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep)
+        else { return image }
+        rep.size = size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        ctx.cgContext.scaleBy(x: scale, y: scale)
+        NSColor.black.setFill()
+        Self.notchPath(in: NSRect(origin: .zero, size: size), radius: radius).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        image.addRepresentation(rep)
+        return image
+    }
+
+    /// 上缘直角 + 下缘两角圆角（= CSS `border-radius: 0 0 16px 16px`）
+    private static func notchPath(in rect: NSRect, radius r: CGFloat) -> NSBezierPath {
+        let rr = max(0, min(r, rect.height))   // 兜底：圆角不许大过整条高度
+        guard rr > 0 else { return NSBezierPath(rect: rect) }
+        let path = NSBezierPath()
+        let x0 = rect.minX, x1 = rect.maxX, y0 = rect.minY, y1 = rect.maxY
+        path.move(to: NSPoint(x: x0, y: y1))                                  // 左上角：直角
+        path.line(to: NSPoint(x: x1, y: y1))                                  // 上缘：贴着屏幕顶沿
+        path.line(to: NSPoint(x: x1, y: y0 + rr))
+        path.appendArc(withCenter: NSPoint(x: x1 - rr, y: y0 + rr), radius: rr,
+                       startAngle: 0, endAngle: -90, clockwise: true)         // 右下角：普通圆角
+        path.line(to: NSPoint(x: x0 + rr, y: y0))                             // 下缘
+        path.appendArc(withCenter: NSPoint(x: x0 + rr, y: y0 + rr), radius: rr,
+                       startAngle: -90, endAngle: -180, clockwise: true)      // 左下角：普通圆角
+        path.line(to: NSPoint(x: x0, y: y1))
+        path.close()
+        return path
+    }
+
+    /// 面板/胶囊通用的遮罩：**四个角的半径可以不一样**。
+    ///
+    /// 折叠的"假刘海"是上缘直角 + 下缘 16 圆角，展开的面板是四角都 18；
+    /// 动画期间这两个数逐帧插值，形状才会跟着一起"长"出来，而不是某一帧突然换掉。
+    ///
+    /// 出小图 + capInsets 三段拉伸（和 `roundedMask` 一个套路）：半径最大 18，
+    /// 一张三十几点见方的小图就够，逐帧重做毫无压力，而且按目标刻度现场绘制，Retina 上不糊。
+    private static func panelMask(topRadius: CGFloat, bottomRadius: CGFloat) -> NSImage {
+        let side = max(topRadius, bottomRadius)
+        let edge = max(1, side * 2 + 1)
+        // 图高 = 上圆角 + 下圆角 + 1px 中间带：两头圆角保持原尺寸，只有中间那一条被拉伸
+        let size = NSSize(width: edge, height: max(1, topRadius + bottomRadius + 1))
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.black.setFill()
+            Self.perCornerPath(in: rect, top: topRadius, bottom: bottomRadius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: topRadius, left: side, bottom: bottomRadius, right: side)
+        image.resizingMode = .stretch
+        return image
+    }
+
+    /// 上下圆角各自独立的圆角矩形（顺时针：上缘 → 右上 → 右缘 → 右下 → 下缘 → 左下 → 左缘 → 左上）
+    private static func perCornerPath(in rect: NSRect, top: CGFloat, bottom: CGFloat) -> NSBezierPath {
+        let x0 = rect.minX, x1 = rect.maxX, y0 = rect.minY, y1 = rect.maxY
+        let half = rect.width / 2
+        let tr = max(0, min(top, half))
+        let br = max(0, min(bottom, half))
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: x0 + tr, y: y1))
+        path.line(to: NSPoint(x: x1 - tr, y: y1))
+        if tr > 0 {
+            path.appendArc(withCenter: NSPoint(x: x1 - tr, y: y1 - tr), radius: tr,
+                           startAngle: 90, endAngle: 0, clockwise: true)
+        }
+        path.line(to: NSPoint(x: x1, y: y0 + br))
+        if br > 0 {
+            path.appendArc(withCenter: NSPoint(x: x1 - br, y: y0 + br), radius: br,
+                           startAngle: 0, endAngle: -90, clockwise: true)
+        }
+        path.line(to: NSPoint(x: x0 + br, y: y0))
+        if br > 0 {
+            path.appendArc(withCenter: NSPoint(x: x0 + br, y: y0 + br), radius: br,
+                           startAngle: -90, endAngle: -180, clockwise: true)
+        }
+        path.line(to: NSPoint(x: x0, y: y1 - tr))
+        if tr > 0 {
+            path.appendArc(withCenter: NSPoint(x: x0 + tr, y: y1 - tr), radius: tr,
+                           startAngle: 180, endAngle: 90, clockwise: true)
+        }
+        path.close()
+        return path
+    }
+
+    private static func roundedMask(radius: CGFloat) -> NSImage {
+        let edge = radius * 2 + 1
+        let image = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        image.resizingMode = .stretch
+        return image
+    }
+
+    // MARK: 菜单栏图标
+
+    private func buildStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            let icon = (NSApp.applicationIconImage.copy() as? NSImage) ?? NSImage()
+            icon.size = NSSize(width: 18, height: 18)
+            button.image = icon
+            button.image?.isTemplate = false
+            button.toolTip = "CloseApps · 应用关闭面板"
+            button.target = self
+            button.action = #selector(statusItemClicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        statusItem = item
+    }
+
+    @objc private func statusItemClicked() {
+        let event = NSApp.currentEvent
+        let isRight = event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true
+        if isRight {
+            showStatusMenu()
+        } else {
+            toggleFromKeyboard()
+        }
+    }
+
+    private func showStatusMenu() {
+        guard let button = statusItem.button else { return }
+        let menu = NSMenu()
+
+        let toggle = NSMenuItem(title: isExpanded ? "收起面板" : "打开面板（\(hotKeyLabel)）",
+                                action: #selector(toggleFromKeyboard), keyEquivalent: "")
+        toggle.target = self
+        menu.addItem(toggle)
+        menu.addItem(.separator())
+
+        let island = NSMenuItem(title: "显示灵动岛胶囊", action: #selector(menuToggleIsland), keyEquivalent: "")
+        island.target = self
+        island.state = UserDefaults.standard.bool(forKey: islandKey) ? .on : .off
+        menu.addItem(island)
+
+        // 位置不缓存，所以这个菜单项只在"本次打开挪开过"时才出现
+        if draggedTopLeft != nil {
+            let reset = NSMenuItem(title: "面板回到初始位置", action: #selector(menuResetIslandPosition), keyEquivalent: "")
+            reset.target = self
+            menu.addItem(reset)
+        }
+
+        if currentScreen().notchRect != nil {
+            let notch = NSMenuItem(title: "折叠时藏进刘海", action: #selector(menuToggleHidesInNotch), keyEquivalent: "")
+            notch.target = self
+            notch.state = hidesInNotch ? .on : .off
+            menu.addItem(notch)
+        }
+
+        let login = NSMenuItem(title: "开机自动启动", action: #selector(menuToggleLoginItem), keyEquivalent: "")
+        login.target = self
+        login.state = LoginItem.isEnabled ? .on : .off
+        if LoginItem.needsApproval {
+            login.title = "开机自动启动（需在系统设置里允许）"
+        }
+        menu.addItem(login)
+
+        let hk = NSMenuItem(title: "修改全局快捷键…", action: #selector(menuEditHotKey), keyEquivalent: "")
+        hk.target = self
+        menu.addItem(hk)
+
+        if !axTrusted() {
+            let ax = NSMenuItem(title: "辅助功能权限…", action: #selector(openAXSettings), keyEquivalent: "")
+            ax.target = self
+            menu.addItem(ax)
+        }
+
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出 CloseApps", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+    }
+
+    // MARK: 展开 / 收起
+
+    /// 当前"视为"的鼠标位置：普通使用就是真实光标，自测/调试里可以注入假坐标
+    private var cursorLocation: NSPoint { fakeCursor ?? NSEvent.mouseLocation }
+
+    private func currentScreen() -> NSScreen {
+        let mouse = cursorLocation
+        return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main ?? NSScreen.screens[0]
+    }
+
+    private func screen(withID id: UInt32) -> NSScreen? {
+        NSScreen.screens.first { $0.displayID == id }
+    }
+
+    private func rectText(_ r: NSRect) -> String {
+        r == .zero ? "无" : "\(Int(r.minX)),\(Int(r.minY)) \(Int(r.width))x\(Int(r.height))"
+    }
+
+    private func offsetText() -> String {
+        guard let p = draggedTopLeft else { return "默认" }
+        return "\(Int(p.x)),\(Int(p.y))"
+    }
+
+    /// 展开面板在某块屏上的尺寸（屏幕太矮就别长到屏幕外面去）
+    private func expandedSize(on screen: NSScreen) -> NSSize {
+        var size = Cfg.expandedSize
+        size.height = min(size.height, screen.visibleFrame.height - 40)
+        return size
+    }
+
+    /// 所有屏幕拼成的整块桌面。拖动跨屏时得按它来夹 —— 按"鼠标现在在哪块屏"夹的话，
+    /// 鼠标一跨过去就会把面板硬拽进新屏里（那正是"瞬间跑过去"的另一个来源）。
+    private var desktopBounds: NSRect {
+        var union: NSRect?
+        for s in NSScreen.screens {
+            union = union.map { $0.union(s.frame) } ?? s.frame
+        }
+        return union ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
+    /// 按左上角放面板，并夹在 `bounds` 里（`minBottom` 是面板下缘不许越过的线）。
+    /// 用左上角而不是左下角：面板顶边是钉在菜单栏/刘海下沿的，夹的时候不能让它顶上去。
+    private func clampedPanel(topLeft p: NSPoint, size: NSSize,
+                              bounds: NSRect, minBottom: CGFloat) -> NSRect {
+        let m = Cfg.dragEdgeMargin
+        var x = p.x
+        x = min(max(x, bounds.minX + m), max(bounds.minX + m, bounds.maxX - size.width - m))
+        var top = min(p.y, bounds.maxY)
+        let lowestTop = minBottom + m + size.height
+        if lowestTop <= bounds.maxY { top = max(top, lowestTop) }
+        return NSRect(x: round(x), y: round(top - size.height), width: size.width, height: size.height)
+    }
+
+    /// 清掉旧版的位置记忆（升级后跑一次就够，之后这里是空操作）
+    private func dropLegacyPositionMemory() {
+        guard UserDefaults.standard.object(forKey: legacyPositionKey) != nil else { return }
+        UserDefaults.standard.removeObject(forKey: legacyPositionKey)
+        dbg("已清掉旧版的位置记忆（位置不再缓存）")
+    }
+
+    /// 顶边固定、只往下长：折叠 = 胶囊/假刘海，展开 = 面板。
+    ///
+    /// 位置规则（v1.7）：**面板每次打开都回到初始位置，位置一律不缓存**。
+    /// `draggedTopLeft` 只是本次展开期间的临时位置，`expand` 一进来就清空；
+    /// 折叠态的胶囊更是钉在屏幕顶部正中，永远不参与位移。
+    private func islandFrame(expanded: Bool) -> NSRect {
+        let screen = currentScreen()
+        let style = collapsedStyle(on: screen)
+
+        // 藏进刘海：正好铺满那块物理盲区，另外往下多留一点做悬停容错
+        if !expanded, style == .hiddenInNotch, let notch = screen.notchRect {
+            return NSRect(x: notch.minX,
+                          y: notch.minY - Cfg.notchHoverMargin,
+                          width: notch.width,
+                          height: notch.height + Cfg.notchHoverMargin)
+        }
+
+        if expanded {
+            let size = expandedSize(on: screen)
+            // ★ 被拖过就用**绝对坐标**：跨屏时面板只跟着鼠标走，不会被另一块屏的
+            //   midX/顶沿当成新基准重新摆一次（那正是"瞬间跑到第二屏"的根因）
+            if let topLeft = draggedTopLeft {
+                return clampedPanel(topLeft: topLeft, size: size,
+                                    bounds: desktopBounds, minBottom: desktopBounds.minY)
+            }
+            // 没被拖过：当前屏顶部正中，顶边贴菜单栏/刘海下沿
+            let baseTop = screen.notchRect?.minY ?? screen.visibleFrame.maxY
+            return clampedPanel(topLeft: NSPoint(x: screen.frame.midX - size.width / 2, y: baseTop),
+                                size: size,
+                                bounds: screen.frame,
+                                minBottom: screen.visibleFrame.minY)
+        }
+
+        // 折叠态：顶边贴屏幕顶沿（假刘海）或刘海/菜单栏下沿，水平居中 —— 永远不吃拖动的偏移
+        let size = style == .fakeNotch
+            ? NSSize(width: Cfg.capsuleWidth, height: capsuleBarHeight(on: screen))
+            : NSSize(width: Cfg.capsuleWidth, height: Cfg.capsuleSize.height)
+        let baseTop = style == .fakeNotch
+            ? screen.frame.maxY
+            : (screen.notchRect?.minY ?? screen.visibleFrame.maxY)
+        return NSRect(x: round(screen.frame.midX - size.width / 2),
+                      y: round(baseTop - size.height),
+                      width: size.width, height: size.height)
+    }
+
+    /// 这块屏此刻该不该"隐形藏进刘海"：有刘海 + 开关开着就行。
+    /// 拖动现在只挪展开的面板，不会再把这个开关搅乱 —— 以前面板一被拖走就判定成
+    /// "不在原位"，于是藏起来的胶囊会突然以普通胶囊的样子冒出来。
+    private func hidesInNotchNow(on screen: NSScreen) -> Bool {
+        hidesInNotch && screen.notchRect != nil
+    }
+
+    /// 折叠态在这块屏上的外观
+    enum CapsuleStyle {
+        /// 有刘海 + 开关开 → 完全隐形（面板铺满刘海那块物理盲区）
+        case hiddenInNotch
+        /// 没有刘海的屏 → 贴屏幕顶沿做成一枚"假刘海"（上缘直角、下缘两角圆角）
+        case fakeNotch
+        /// 有刘海但开关关了 → 普通悬浮胶囊，挂在刘海下沿
+        case plain
+    }
+
+    private func collapsedStyle(on screen: NSScreen) -> CapsuleStyle {
+        if hidesInNotchNow(on: screen) { return .hiddenInNotch }
+        return screen.notchRect == nil ? .fakeNotch : .plain
+    }
+
+    /// 折叠条的"条高"：无刘海屏要和菜单栏一样高，看起来才像一块真刘海
+    private func capsuleBarHeight(on screen: NSScreen) -> CGFloat {
+        let bar = screen.menuBarHeight
+        return bar > 8 ? bar : 24
+    }
+
+    func expand(activateApp: Bool) {
+        collapseWork?.cancel()
+        collapseWork = nil
+        // ★ 每一次打开都回初始位置：位置不缓存，上次拖动留下的临时位置在这里清空
+        draggedTopLeft = nil
+        // 本来就已经展开的话（面板开着又按了一次快捷键之类），位置/形状/内容都到位了，
+        // 不要再"演"一遍 —— 再演一次会让胶囊内容闪回来、面板内容重新渐显
+        let wasExpanded = isExpanded
+        if !wasExpanded {
+            isExpanded = true
+            reload(force: true)
+            startRefresh()
+            detail.alphaValue = 0
+            expandedOnly.forEach { $0.alphaValue = 0 }
+            capsuleStack.alphaValue = 1      // 交给动画逐帧淡出（不能再走 animator，会跟逐帧赋值打架）
+        }
+        // 从刘海/胶囊态出来：视觉和阴影要回来。圆角不在这里定死 ——
+        // 折叠态可能根本没有圆角（假刘海），直接换会"跳"一下，交给动画逐帧过渡
+        container?.alphaValue = 1
+        panel?.hasShadow = true
+        headerHeightConstraint?.constant = Cfg.headerHeight
+
+        if activateApp {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+        } else {
+            panel.orderFront(nil)
+        }
+        lastScreenID = currentScreen().displayID
+        // 记住这一刻的折叠命中区：展开后鼠标还停在刘海/胶囊那一带时，不能算"离开"
+        collapsedHitRect = islandFrame(expanded: false)
+        clearReopenBlock(reason: "面板已展开")
+        if activateApp {
+            // 快捷键/菜单打开的：鼠标本来就不在面板上，不能按"鼠标离开"去收它
+            stopHoverPoll()
+        } else {
+            startHoverPoll()
+        }
+        let target = islandFrame(expanded: true)
+        dbg("expand -> \(Int(target.minX)),\(Int(target.minY)) \(Int(target.width))x\(Int(target.height)) activate=\(activateApp) 命中区=\(rectText(collapsedHitRect))")
+        startMorph(to: target, expanding: true, choreographContent: !wasExpanded)
+    }
+
+    func collapse(animated: Bool) {
+        guard isExpanded else { return }
+        isExpanded = false
+        recorder?.cancelRecording()
+        stopRefresh()
+        // 录制中途收起：把原来能用的快捷键装回去
+        if !hotKey.isRegistered {
+            applyHotKey(code: hotKeyCode, mods: hotKeyMods, label: hotKeyLabel, quiet: true)
+        }
+        collapseWork?.cancel()
+        collapseWork = nil
+        stopHoverPoll()
+        // 收起这一刻的折叠命中区，等下用来判断"鼠标是不是还赖在原地"
+        collapsedHitRect = islandFrame(expanded: false)
+        armReopenGuardIfNeeded()
+
+        let target = islandFrame(expanded: false)
+        dbg("collapse -> \(Int(target.minX)),\(Int(target.minY)) \(Int(target.width))x\(Int(target.height)) animated=\(animated)")
+        if animated {
+            startMorph(to: target, expanding: false)
+        } else {
+            // 自测/立刻收起：不走动画，直接把终点摆上
+            morphDriver?.cancel()
+            morphDriver = nil
+            detail.alphaValue = 0
+            expandedOnly.forEach { $0.alphaValue = 0 }
+            capsuleStack.alphaValue = 1
+            panel.setFrame(target, display: true)
+            applyCollapsedAppearance()
+        }
+    }
+
+    /// 展开/收起共用的"形变"动画：面板 frame、四角圆角、内容透明度挂在**同一条**弹簧曲线上，
+    /// 一起起步、一起收尾。分开跑就是上一版那个样子 —— 面板先长完、内容再补上，一眼假。
+    ///
+    /// - `expanding == true`：从当前帧长到 `target`（胶囊内容让位、面板内容淡入）
+    /// - `expanding == false`：缩回去（反过来）
+    /// - `choreographContent == false`：只动 frame/形状，不碰内容透明度（本来就是展开态时用）
+    private func startMorph(to target: NSRect, expanding: Bool, choreographContent: Bool = true) {
+        let start = panel.frame
+        let startShape = (shapeTopRadius, shapeBottomRadius)
+        let endShape = expanding
+            ? (Cfg.cornerRadius, Cfg.cornerRadius)
+            : shapeRadii(for: collapsedStyle(on: currentScreen()))
+
+        // 同一时刻只留一个动画：新的从"当前这一刻的 frame"接着走，
+        // 所以"展开到一半又收起"是顺着当前速度拐回去，不会跳一下
+        morphDriver?.cancel()
+        let driver = SpringDriver(label: expanding ? "展开" : "收起",
+                                  response: expanding ? Cfg.expandResponse : Cfg.collapseResponse,
+                                  damping: Cfg.morphDamping) { [weak self] p, finished in
+            guard let self else { return }
+            // display: false —— 只标记"这一块要重绘"，交给本轮正常的显示周期。
+            // 逐帧 display: true 会强制同步把十几张卡片重刷一遍，一帧十几毫秒，
+            // 120Hz 上等于把主线程占满（帧间隔忽大忽小 = 肉眼看到的"不够顺"）
+            self.panel.setFrame(Self.morphRect(from: start, to: target, progress: p), display: false)
+            self.applyShape(topRadius: Self.lerp(startShape.0, endShape.0, p),
+                            bottomRadius: Self.lerp(startShape.1, endShape.1, p))
+
+            if choreographContent {
+                // 内容跟着同一条曲线走：胶囊内容在前 40% 让位，面板内容在 8%~70% 之间淡入。
+                // 两段有意重叠 —— 一先一后（上一版"长完再补"）就会被看出是两拍。
+                let handover = min(1, max(0, p / 0.4))
+                self.capsuleStack.alphaValue = expanding ? 1 - handover : handover
+                let content = min(1, max(0, (p - 0.08) / 0.62))
+                let contentAlpha = expanding ? content : 1 - content
+                self.detail.alphaValue = contentAlpha
+                self.expandedOnly.forEach { $0.alphaValue = contentAlpha }
+            }
+
+            if finished {
+                self.panel.setFrame(target, display: true)
+                self.morphDriver = nil
+                // 缩回刘海/假刘海之后才隐去视觉：动画期间还得看得见它在缩
+                if !expanding { self.applyCollapsedAppearance() }
+            }
+        }
+        morphDriver = driver
+        driver.start()
+    }
+
+    /// 面板按进度变形。**位置（左右 + 顶边）用夹在 1 的进度，尺寸用原始进度** ——
+    /// 弹簧那一点点过冲只体现在"长得略大一点"上：顶边要是也跟着过冲，面板会越过
+    /// 菜单栏/刘海下沿去压住系统菜单，左右也跟着过冲的话看着像在抖。
+    private static func morphRect(from a: NSRect, to b: NSRect, progress t: Double) -> NSRect {
+        let k = CGFloat(min(max(t, 0), 1))   // 位置：不许过头
+        let g = CGFloat(t)                   // 尺寸：允许一点点过冲
+        let x = a.minX + (b.minX - a.minX) * k
+        let top = a.maxY + (b.maxY - a.maxY) * k
+        let w = a.width + (b.width - a.width) * g
+        let h = a.height + (b.height - a.height) * g
+        return NSRect(x: x, y: top - h, width: w, height: h)
+    }
+
+    private static func lerp(_ a: CGFloat, _ b: CGFloat, _ t: Double) -> CGFloat {
+        a + (b - a) * CGFloat(t)
+    }
+
+    /// 点卡片激活别的应用后自动收起（鼠标已经不在面板上了）
+    func collapseAfterActivating(appName: String) {
+        if isPinned {
+            setStatus("已切到「\(appName)」· 面板已钉住，不收起")
+        } else {
+            setStatus("已切到「\(appName)」")
+            collapse(animated: true)
+        }
+    }
+
+    private func mouseEnteredIsland() {
+        dbg("hover-enter")
+        collapseWork?.cancel()
+        collapseWork = nil
+        guard !isExpanded, !isDraggingIsland else { return }
+        guard UserDefaults.standard.bool(forKey: islandKey) else { return }
+        guard !reopenBlocked else {
+            dbg("hover-enter 被拦：鼠标还没离开命中区")
+            return
+        }
+        // 进出事件在窗口动画期间会自己抖出来，用真实坐标核一遍
+        guard islandFrame(expanded: false).contains(cursorLocation) else {
+            dbg("hover-enter 忽略：坐标 \(cursorLocation) 不在命中区")
+            return
+        }
+        expand(activateApp: false)
+    }
+
+    private func mouseExitedIsland() {
+        dbg("hover-exit")
+        guard isExpanded, !isPinned, !isDraggingIsland, !(recorder?.isRecording ?? false) else { return }
+        checkCursorInsideExpanded()
+    }
+
+    // MARK: 悬停判定（只看坐标，不看控件进出事件）
+
+    private func startHoverPoll() {
+        stopHoverPoll()
+        let timer = Timer(timeInterval: Cfg.hoverPollInterval, repeats: true) { [weak self] _ in
+            self?.checkCursorInsideExpanded()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        hoverPollTimer = timer
+    }
+
+    private func stopHoverPoll() {
+        hoverPollTimer?.invalidate()
+        hoverPollTimer = nil
+    }
+
+    /// "还算在面板里"的范围 = 面板本身 ∪ 折叠命中区。
+    /// 后半截是关键：有刘海的屏上，折叠命中区比展开面板的顶边还高出一截，
+    /// 鼠标停在刘海正中最自然的位置时，展开面板根本够不着 —— 以前就是这么"来不及移进去就关了"。
+    private func checkCursorInsideExpanded() {
+        guard isExpanded, !isPinned, !isDraggingIsland, !(recorder?.isRecording ?? false) else { return }
+        let inside = panel.frame.insetBy(dx: -1, dy: -1).contains(cursorLocation)
+            || collapsedHitRect.contains(cursorLocation)
+        if inside {
+            if collapseWork != nil {
+                collapseWork?.cancel()
+                collapseWork = nil
+                dbg("光标又回来了，取消收起")
+            }
+        } else if collapseWork == nil {
+            scheduleCollapse()
+        }
+    }
+
+    private func scheduleCollapse() {
+        collapseWork?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.collapse(animated: true) }
+        collapseWork = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Cfg.collapseDelay, execute: item)
+    }
+
+    // MARK: 重开锁
+    //
+    // 收起时鼠标还停在命中区里（点了卡片切应用、按了快捷键、鼠标在原地没动），
+    // 这时如果立刻允许重开，面板会"关了又开"来回抽风。所以加锁 —— 但解锁条件是
+    // **鼠标离开**，不是"过 N 秒"：以前用固定 0.7 秒时间窗，鼠标一直在旁边蹭的
+    // 时候就死活打不开，得等窗口过期，手感就是"连续 hover 打不开"。
+
+    private func armReopenGuardIfNeeded() {
+        guard collapsedHitRect.contains(cursorLocation) else {
+            clearReopenBlock(reason: "鼠标不在命中区，无需加锁")
+            return
+        }
+        reopenBlocked = true
+        reopenGuardWork?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.clearReopenBlock(reason: "兜底超时") }
+        reopenGuardWork = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Cfg.reopenGuardFallback, execute: item)
+        startReopenWatch()
+        dbg("重开加锁：鼠标还赖在命中区里")
+    }
+
+    private func startReopenWatch() {
+        guard reopenWatchTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+            guard let self, self.reopenBlocked else { return }
+            if !self.collapsedHitRect.contains(self.cursorLocation) {
+                self.clearReopenBlock(reason: "鼠标已移开")
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        reopenWatchTimer = timer
+    }
+
+    private func clearReopenBlock(reason: String) {
+        guard reopenBlocked || reopenWatchTimer != nil || reopenGuardWork != nil else { return }
+        reopenBlocked = false
+        reopenGuardWork?.cancel()
+        reopenGuardWork = nil
+        reopenWatchTimer?.invalidate()
+        reopenWatchTimer = nil
+        dbg("重开解锁（\(reason)）")
+    }
+
+    // MARK: 拖动灵动岛
+    //
+    // 折叠态整条都能按住拖；展开态则只认标题栏那条（卡片、按钮照常点）。
+    // 位置按屏幕分别记住，下次开机还在那儿。
+
+    /// 折叠态：胶囊钉死在屏幕顶部正中，不参与拖动（拖动只挪展开的面板）。
+    /// 展开态：标题栏空白和标题那几块能拖，但**命中控件时一律让路** ——
+    /// 标题栏是整条 596 宽的把手，右上角那排按钮（录制/置顶/刷新/收起）是它的子视图，
+    /// 只按"是不是把手的子孙"判断的话，按钮会被 mouseDown 抢走 → 这就是"按钮点不动"的根因。
+    private func shouldCaptureMouseForDrag(hitView: NSView) -> Bool {
+        guard isExpanded else { return false }
+        if Self.isInteractiveControl(hitView) { return false }
+        return dragHandleViews.contains { hitView === $0 || hitView.isDescendant(of: $0) }
+    }
+
+    /// 命中的是不是"用户想点"的控件：看它自己以及祖先链上有没有按钮/录制器。
+    /// 只认控件类型、不认视图层级，把手是新加的还是挪了位置都不影响判断。
+    private static func isInteractiveControl(_ view: NSView) -> Bool {
+        var current: NSView? = view
+        while let v = current {
+            if v is NSButton || v is HotKeyRecorder { return true }
+            current = v.superview
+        }
+        return false
+    }
+
+    private func beginIslandDrag() {
+        // 折叠态的胶囊不参与拖动 —— 它钉在屏幕顶部正中，拖动只挪展开的面板。
+        // 正常交互里也轮不到这一步：鼠标一 hover 上来就展开（mouseEntered 是同步的），
+        // 真按下时早就是展开态了。所以这里拦掉不影响"拖得动"。
+        guard isExpanded else {
+            dbg("drag begin 忽略：折叠态的胶囊不可拖")
+            return
+        }
+        // 展开态也要能拖 —— 鼠标一 hover 上来面板就展开了，等按下时早就不是折叠态，
+        // 这里要是还把展开态拦掉，用户就永远拖不动它（「面板拖不动」的根因就在这）。
+        isDraggingIsland = true
+        dragAccumulated = 0
+        // 拖动按"绝对位置"走：记下这一刻面板的左上角，之后每步只往上加位移。
+        // 不再拿"当前屏中心"当基准 —— 鼠标跨屏时那玩意儿会整块跳。
+        let f = panel.frame
+        draggedTopLeft = NSPoint(x: f.minX, y: f.maxY)
+        collapseWork?.cancel()
+        collapseWork = nil
+        clearReopenBlock(reason: "开始拖动")
+        dbg("drag begin screen=\(currentScreen().displayID)")
+    }
+
+    private func dragIslandBy(dx: CGFloat, dy: CGFloat) {
+        guard isDraggingIsland else { return }
+        dragAccumulated += abs(dx) + abs(dy)
+        guard var topLeft = draggedTopLeft else { return }
+        topLeft.x += dx
+        topLeft.y += dy
+        draggedTopLeft = topLeft
+        // 拖的永远是展开的面板 —— 折叠态在 beginIslandDrag 那一步就被挡回去了。
+        // 位置是绝对的，所以鼠标跨屏时这里不需要任何特殊处理，一路跟着走
+        panel.setFrame(islandFrame(expanded: true), display: true)
+    }
+
+    private func endIslandDrag() {
+        guard isDraggingIsland else { return }
+        isDraggingIsland = false
+        // 只是点了一下，没真拖动 —— 别弹提示
+        guard dragAccumulated >= 3 else {
+            dbg("drag: 累计位移只有 \(Int(dragAccumulated))pt，按「没拖」处理")
+            return
+        }
+        // 这次挪开只管这一次：位置不缓存，下次打开仍在顶部正中
+        setStatus("面板已挪开（位置不缓存，下次打开仍在初始位置）")
+        dbg("drag end 临时位置=\(offsetText())（绝对坐标，跨屏不会跳）")
+    }
+
+    /// 把面板挪回初始位置（右键菜单项 / stdin `resetpos`）。
+    /// 位置本来就不缓存，这里只是让"本次展开期间"的临时偏移提前归零。
+    private func resetIslandPosition() {
+        draggedTopLeft = nil
+        panel.setFrame(islandFrame(expanded: isExpanded), display: true)
+        applyCollapsedAppearance()
+        setStatus("面板已回到初始位置")
+        dbg("position reset（临时偏移归零）")
+    }
+
+    // MARK: 自测辅助（只有 CLOSEAPPS_SELFTEST / DEBUG 会用）
+
+    /// 折叠命中区的中心：悬停展开打的就是这里
+    private func capsuleCenter() -> NSPoint {
+        let f = islandFrame(expanded: false)
+        return NSPoint(x: f.midX, y: f.midY)
+    }
+
+    /// 一个"在折叠命中区里、但在展开面板之外"的点：有刘海时就是刘海正中最上面那一带，
+    /// 也正是以前会把面板误判成"鼠标已离开"、害用户来不及移进去就关掉的位置
+    private func hoverGraceProbe() -> NSPoint {
+        let hit = islandFrame(expanded: false)
+        let expanded = islandFrame(expanded: true)
+        return NSPoint(x: hit.midX, y: max(hit.maxY - 4, expanded.maxY + 4))
+    }
+
+    /// 把一次拖动（按下 → 移动 → 松手）走完
+    private func simulateDrag(dx: CGFloat, dy: CGFloat) {
+        beginIslandDrag()
+        dragIslandBy(dx: dx, dy: dy)
+        endIslandDrag()
+    }
+
+    /// 展开态下标题栏右上角那排按钮必须"点得到"：命中测试要落在按钮上，
+    /// 而且不能被判给拖动把手（以前整条标题栏都是把手，按钮一按就被 mouseDown 抢走）。
+    private func probeHeaderHitTest() {
+        guard isExpanded, let c = container, let pin = pinButton else {
+            dbg("hit-test: 不在展开态或缺控件，跳过")
+            return
+        }
+        let winPoint = pin.convert(NSPoint(x: pin.bounds.midX, y: pin.bounds.midY), to: nil)
+        guard let hit = c.hitTest(winPoint) else {
+            // 容器还停在展开动画中途的尺寸时，标题栏右上角那个点会落到容器外 —— 这不是按钮的问题
+            let want = islandFrame(expanded: true).size
+            dbg("hit-test: 置顶按钮处没命中任何视图（面板 \(Int(panel.frame.width))x\(Int(panel.frame.height))，"
+                + "展开应为 \(Int(want.width))x\(Int(want.height)) → 多半是动画还没走完，跳过）")
+            return
+        }
+        let captured = shouldCaptureMouseForDrag(hitView: hit)
+        dbg("hit-test: 置顶按钮 → \(type(of: hit))｜拖动接管=\(captured ? "是 ✗ 按钮会被拖走" : "否 ✓ 按钮可点")")
+    }
+
+    /// ★「跨屏拖动不跳」的回归断言。
+    ///
+    /// 老实现把位置存成"相对当前屏中心的偏移"，而"当前屏"看的是鼠标在哪块屏：
+    /// 鼠标一跨到另一块屏，基准 screen.midX 直接换一个值，面板就瞬间平移到新屏的
+    /// 对应位置（用户原话：在大屏右侧拖到第二屏，就闪到第二屏的右侧去了）。
+    /// 现在位置是绝对坐标，跨屏只应该跟着鼠标走那么一小步。
+    private func probeCrossScreenDrag() {
+        let screens = NSScreen.screens
+        guard screens.count >= 2 else {
+            dbg("跨屏拖动: 本机只有 \(screens.count) 块屏，这条断言不适用（跳过）")
+            return
+        }
+        let a = screens[0], b = screens[1]
+        fakeCursor = NSPoint(x: a.frame.midX, y: a.frame.midY)
+        beginIslandDrag()
+        let before = panel.frame
+        let stepX: CGFloat = 6, stepY: CGFloat = -4
+        // 光标一步跨到另一块屏上，而位移只走了这么一点
+        fakeCursor = NSPoint(x: b.frame.midX, y: b.frame.midY)
+        dragIslandBy(dx: stepX, dy: stepY)
+        let after = panel.frame
+        endIslandDrag()
+        let dx = after.minX - before.minX, dy = after.minY - before.minY
+        let midGap = b.frame.midX - a.frame.midX
+        let ok = abs(dx - stepX) < 1.5 && abs(dy - stepY) < 1.5
+        dbg("跨屏拖动: \(a.localizedName)→\(b.localizedName) 两屏中线差=\(Int(midGap))pt｜"
+            + "面板位移=\(Int(dx)),\(Int(dy)) 期望=\(Int(stepX)),\(Int(stepY)) "
+            + (ok ? "✓ 只跟着鼠标走，没被另一块屏拽走" : "✗ 跨屏瞬间跳了"))
+        // 光标放回面板自己身上：后面的步骤（收起/重开）就按面板所在的那块屏继续
+        fakeCursor = NSPoint(x: after.midX, y: after.midY)
+    }
+
+    /// 连采若干帧，量一下展开动画顺不顺（自测用）。
+    /// 顺滑 = 相邻两帧的位移都不大、也不忽大忽小；卡顿会表现为某一帧突然挪一大截。
+    private func trackMorphMotion(_ tag: String) {
+        morphTrack = []
+        // ⚠️ 目标帧在"开跑那一刻"就定下来。收尾时再算一次是不可靠的：`islandFrame` 认的是
+        // `currentScreen()`（看注入的光标落在哪块屏，全都不在就退到 NSScreen.main），
+        // 采样窗口里只要这个基准变一次，就会拿另一块屏的目标去判这块屏的末帧，报假红。
+        morphTarget = islandFrame(expanded: true)
+        let steps = 15
+        let gap = 0.026
+        for i in 0..<steps {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i + 1) * gap) { [weak self] in
+                guard let self else { return }
+                self.morphTrack.append(self.panel.frame)
+                if i == steps - 1 { self.reportMorphMotion(tag) }
+            }
+        }
+    }
+
+    private func reportMorphMotion(_ tag: String) {
+        guard morphTrack.count >= 3, let target = morphTarget else {
+            dbg("morph[\(tag)]: 采样不足，跳过")
+            return
+        }
+        var deltas: [CGFloat] = []
+        for i in 1..<morphTrack.count {
+            let a = morphTrack[i - 1], b = morphTrack[i]
+            deltas.append(abs(b.midX - a.midX) + abs(b.midY - a.midY))
+        }
+        let maxDelta = deltas.max() ?? 0
+        let avg = deltas.reduce(0, +) / CGFloat(deltas.count)
+        let maxHeight = morphTrack.map(\.height).max() ?? 0
+        let overshoot = max(0, maxHeight - target.height)
+        let last = morphTrack[morphTrack.count - 1]
+        let settled = abs(last.maxY - target.maxY) < 2 && abs(last.height - target.height) < 2
+        dbg("morph[\(tag)]: 采样\(morphTrack.count)点/间隔26ms｜相邻位移 最大=\(Int(maxDelta))pt 平均=\(Int(avg))pt｜"
+            + "过冲=\(Int(overshoot))pt（目标高\(Int(target.height))）｜末帧=\(rectText(last)) 目标=\(rectText(target)) "
+            + "差=\(Int(last.maxY - target.maxY))pt/\(Int(last.height - target.height))pt "
+            + (settled ? "✓ 已落到目标" : "✗ 还没走完/没落准"))
+    }
+
+    /// 折叠态的胶囊必须钉在屏幕顶部正中：位置只由当前屏决定，任何临时偏移都不准影响它。
+    private func probeCapsulePinned() {
+        let screen = currentScreen()
+        let frame = islandFrame(expanded: false)
+        let expectX = round(screen.frame.midX - frame.width / 2)
+        let pinned = abs(frame.minX - expectX) < 1.5
+        dbg("胶囊定位: 拖动位置=\(offsetText())｜实际x=\(Int(frame.minX)) 期望x=\(Int(expectX)) "
+            + (pinned ? "✓ 没被拖走" : "✗ 跟着面板跑了"))
+    }
+
+    /// 开机启动的**只读**探测。
+    ///
+    /// ⚠️ 以前自测里直接调 `menuToggleLoginItem()` 开关一遍 —— 而 `SMAppService.mainApp`
+    /// 注册的是"**正在跑的那份 bundle**"。于是每跑一次自测，开机项就被重新注册成当时那份副本
+    /// （实测被挂到了工作树里的开发副本上，开机拉起的是开发版，不是 /Applications 那份）。
+    /// 自测只该看，不该动用户的系统设置。
+    private func probeLoginItem() {
+        dbg("开机启动（只读，不改动）: 已启用=\(LoginItem.isEnabled) 待批准=\(LoginItem.needsApproval)"
+            + "｜当前 bundle=\(Bundle.main.bundlePath)")
+    }
+
+    /// ★ 折叠条形状的回归断言：两层裁剪（layer 圆角 + 毛玻璃遮罩）都得是
+    /// `0 0 16px 16px`（上缘直角、下缘 16）。看得见的胶囊一旦变成整圈圆角的"药丸"，
+    /// 用户一眼就看出来不对 —— 这条就是盯着它的。
+    private func probeCapsuleShape() {
+        let screen = currentScreen()
+        let style = collapsedStyle(on: screen)
+        let want = shapeRadii(for: style)
+        let layerR = container.layer?.cornerRadius ?? -1
+        let topOK = abs(shapeTopRadius - want.top) < 0.5
+        let bottomOK = abs(shapeBottomRadius - want.bottom) < 0.5
+        let layerOK = abs(layerR - min(want.top, want.bottom)) < 0.5
+        let hidden = style == .hiddenInNotch
+        let maskText = fullSizeMask != nil && maskUsedFullSize ? "真尺寸图" : "小图拉伸"
+        dbg("折叠条形状: 样式=\(style)\(hidden ? "（隐形，形状无所谓）" : "")"
+            + "｜目标=上\(Int(want.top))/下\(Int(want.bottom)) 生效=上\(Int(shapeTopRadius))/下\(Int(shapeBottomRadius))"
+            + " layer圆角=\(Int(layerR)) 遮罩=\(maskText)"
+            + " 尺寸=\(Int(panel.frame.width))x\(Int(panel.frame.height))"
+            + " " + (topOK && bottomOK && layerOK
+                     ? (want.top < 0.5 ? "✓ 上缘直角 + 下缘 \(Int(want.bottom)) 圆角（0 0 16 16）"
+                                       : "✓ 四角都是 \(Int(want.top)) 圆角（隐形态，形状看不见）")
+                     : "✗ 形状不对"))
+    }
+
+    /// ★ 滚动条宽度的回归断言。
+    ///
+    /// 宽度是 `NSScroller` 的**类方法**算的，所以"换了子类"还不算数 —— 得看 NSScrollView
+    /// 是不是真的按子类给的宽度去布局。面板自己的滚动视图会随内容多少决定显不显示滚动条
+    /// （内容不长时它是隐藏的、frame 为 0，量了也白量），所以这里当场手搓一个**内容一定超高**
+    /// 的滚动视图把滚动条逼出来，量它的实际占宽。
+    private func probeScroller() {
+        let style = NSScroller.preferredScrollerStyle          // 跟随系统设置（"总是显示"= 传统样式）
+        let sysW = NSScroller.scrollerWidth(for: .regular, scrollerStyle: style)
+        let probe = NSScrollView(frame: NSRect(x: 0, y: 0, width: 200, height: 60))
+        probe.hasVerticalScroller = true
+        probe.autohidesScrollers = false
+        probe.verticalScroller = ThinScroller()
+        probe.documentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 900))
+        probe.layoutSubtreeIfNeeded()
+        let kind = probe.verticalScroller.map { String(describing: type(of: $0)) } ?? "无"
+        let width = probe.verticalScroller.map { $0.frame.width } ?? -1
+        let ok = width > 0 && width <= ThinScroller.width + 1 && width < sysW
+        dbg("滚动条: 类型=\(kind) 系统=\(style == .overlay ? "浮动" : "传统")样式 默认 \(Int(sysW))pt"
+            + " → 实测布局 \(Int(width))pt "
+            + (ok ? "✓ 比系统细" : "✗ 宽度没生效"))
+    }
+
+    /// ★ 「无刘海屏那枚假刘海 = 0 0 16 16」的回归断言。
+    ///
+    /// 不靠"鼠标此刻在哪块屏"，自己找一块没有刘海的屏，把假光标挪过去、按换屏那套动作重摆一次
+    /// （和 `followMouseScreen` 同一条路径），再量形状：贴屏幕顶沿、上缘直角、下缘 16 圆角，
+    /// 而且用的是真尺寸遮罩（不是小图拉伸）。
+    private func probeFakeNotchShape() {
+        guard let screen = NSScreen.screens.first(where: { $0.notchRect == nil }) else {
+            dbg("假刘海形状: 本机每块屏都有刘海，没有这一态（跳过）")
+            return
+        }
+        fakeCursor = NSPoint(x: screen.frame.midX, y: screen.frame.maxY - 4)
+        panel.setFrame(islandFrame(expanded: false), display: false)
+        applyCollapsedAppearance()
+        let style = collapsedStyle(on: screen)
+        let want = shapeRadii(for: style)
+        let frame = panel.frame
+        let bar = capsuleBarHeight(on: screen)
+        let topAligned = abs(frame.maxY - screen.frame.maxY) < 1.5
+        let sizeOK = abs(frame.width - Cfg.capsuleWidth) < 1.5 && abs(frame.height - bar) < 1.5
+        let shapeOK = abs(shapeTopRadius - want.top) < 0.5 && abs(shapeBottomRadius - want.bottom) < 0.5
+        let layerOK = abs((container.layer?.cornerRadius ?? -1) - min(want.top, want.bottom)) < 0.5
+        let ok = style == .fakeNotch && topAligned && sizeOK && shapeOK && layerOK && maskUsedFullSize
+        dbg("假刘海形状: 屏=\(screen.localizedName) 样式=\(style)"
+            + " 条=\(Int(frame.width))x\(Int(frame.height))（菜单栏高 \(Int(bar))）"
+            + " 顶边贴屏顶=\(topAligned) 上缘=\(Int(shapeTopRadius)) 下缘=\(Int(shapeBottomRadius))"
+            + " layer圆角=\(Int(container.layer?.cornerRadius ?? -1))"
+            + " 遮罩=\(maskUsedFullSize ? "真尺寸图" : "小图拉伸")"
+            + " " + (ok ? "✓ 上缘直角 + 下缘 16 圆角" : "✗ 形状/位置不对"))
+    }
+
+    /// ★ 「打开就回初始位置」的回归断言：拖开 → 收起 → 再打开，
+    /// 位置必须回到默认（临时偏移归零、x 居中、顶边贴菜单栏/刘海下沿）。
+    ///
+    /// ⚠️ 判据要用 `islandFrame`，**不能拿 `panel.frame` 比** —— 展开是弹簧动画（约 0.4s），
+    /// 读到的很可能是途中的值，白得一个假阴性（第一版就是这么写的）。
+    private func probeExpandResetsPosition() {
+        let screen = currentScreen()
+        let target = islandFrame(expanded: true)
+        let baseTop = screen.notchRect?.minY ?? screen.visibleFrame.maxY
+        let centered = abs(target.midX - screen.frame.midX) < 1.5
+        let topAligned = abs(target.maxY - baseTop) < 1.5
+        let noOffset = draggedTopLeft == nil
+        let ok = centered && topAligned && noOffset
+        dbg("重开归位: 拖动位置=\(offsetText())｜目标框=\(rectText(target)) 居中=\(centered) 顶边贴栏=\(topAligned) "
+            + (ok ? "✓ 回到初始位置" : "✗ 还带着旧位置"))
+    }
+
+    /// 双屏时胶囊跟着鼠标走：折叠态每 1 秒看一眼鼠标在哪块屏，跨屏了就挪过去
+    private func followMouseScreen() {
+        guard !isExpanded, panel.isVisible else { return }
+        guard UserDefaults.standard.bool(forKey: islandKey) else { return }
+        let id = currentScreen().displayID
+        guard id != lastScreenID else { return }
+        lastScreenID = id
+        panel.setFrame(islandFrame(expanded: false), display: true)
+        applyCollapsedAppearance()   // 换屏了：目标屏可能有/没有刘海，视觉状态跟着切
+        dbg("island -> 屏幕 \(id) 有刘海=\(currentScreen().notchRect != nil)")
+    }
+
+    private func applyIslandVisibility() {
+        let show = UserDefaults.standard.bool(forKey: islandKey)
+        if show {
+            panel.setFrame(islandFrame(expanded: isExpanded), display: false)
+            panel.orderFront(nil)
+            applyCollapsedAppearance()
+        } else if !isExpanded {
+            panel.orderOut(nil)
+        }
+    }
+
+    /// 折叠态该长什么样。屏幕有刘海且开关开着 → 彻底隐去视觉（阴影必须一起关：
+    /// 面板藏在刘海后面，阴影会投到刘海下面露馅）；没有刘海的屏 → 做成一枚"假刘海"。
+    private func applyCollapsedAppearance() {
+        guard !isExpanded else { return }
+        // 折叠态不占键盘焦点：拖一下胶囊会让面板变成 key window，
+        // 之后用户接着打字就被这枚胶囊吞了。折叠着的时候把焦点还回去。
+        if panel.isKeyWindow { panel.resignKey() }
+        let screen = currentScreen()
+        let style = collapsedStyle(on: screen)
+        let hidden = style == .hiddenInNotch
+        container?.alphaValue = hidden ? 0 : 1
+        panel?.hasShadow = !hidden
+        applyCapsuleShape(style)
+        dbg("collapsed appearance: 样式=\(style) 隐身=\(hidden) 条高=\(Int(capsuleBarHeight(on: screen)))")
+    }
+
+    /// 当前实际生效的上下圆角。展开动画逐帧改的就是它，也是下一个动画的起点
+    private var shapeTopRadius: CGFloat = Cfg.cornerRadius
+    private var shapeBottomRadius: CGFloat = Cfg.cornerRadius
+    /// 上一次真正喂给遮罩的圆角：差得不多就不重做遮罩
+    private var maskTopRadius: CGFloat = -1
+    private var maskBottomRadius: CGFloat = -1
+    /// 上一次用的是不是"真尺寸出图"那张遮罩（见 applyShape）
+    private var maskUsedFullSize = false
+    /// 真尺寸遮罩的缓存（key = 尺寸@刻度+圆角）
+    private var fullSizeMaskKey = ""
+    private var fullSizeMask: NSImage?
+
+    /// 某个折叠样式的四角半径（上, 下）。
+    ///
+    /// **折叠态但凡是看得见的，都是 `border-radius: 0 0 16px 16px`** —— 上缘两个直角、
+    /// 下缘两角 16 圆角：看上去就是"从屏幕顶上垂下来的一整块"。
+    /// 无刘海屏那枚贴屏幕顶沿；有刘海屏关掉「折叠时藏进刘海」时那枚胶囊吊在刘海正下方，
+    /// 上缘直角正好跟刘海接上（胶囊 176 宽、刘海 185 宽，宽度也基本对得上）。
+    /// 藏进刘海那一态是隐形的，圆角取多少都看不见，跟面板的 18 走。
+    private func shapeRadii(for style: CapsuleStyle) -> (top: CGFloat, bottom: CGFloat) {
+        switch style {
+        case .fakeNotch, .plain: return (0, Cfg.fakeNotchRadius)
+        case .hiddenInNotch: return (Cfg.cornerRadius, Cfg.cornerRadius)
+        }
+    }
+
+    /// 折叠条的形状：无刘海屏那枚是"假刘海"（上缘直角、下缘两角圆角，见 perCornerPath），
+    /// 其余是圆角胶囊。裁剪做了两层（layer 圆角 + 毛玻璃 maskImage），所以两边都要跟着切。
+    private func applyCapsuleShape(_ style: CapsuleStyle) {
+        let r = shapeRadii(for: style)
+        applyShape(topRadius: r.top, bottomRadius: r.bottom)
+        // 折叠时把头部压到"条高"，胶囊里的图标文字才垂直居中
+        headerHeightConstraint?.constant = style == .fakeNotch
+            ? capsuleBarHeight(on: currentScreen())
+            : Cfg.headerHeight
+    }
+
+    /// 把四角半径落到两层裁剪上（layer 圆角 + 毛玻璃遮罩）。展开动画会逐帧调它，
+    /// 所以这里只做"把当前值摆上去"，不判断状态、不做别的事。
+    private func applyShape(topRadius: CGFloat, bottomRadius: CGFloat) {
+        shapeTopRadius = topRadius
+        shapeBottomRadius = bottomRadius
+        // layer 的圆角是四角统一的，取小的那个顶事（大半径那两个角由遮罩负责）
+        container?.layer?.cornerRadius = min(topRadius, bottomRadius)
+        // 折叠态那枚"上缘直角 + 下缘圆角"改用**真尺寸出图**：圆角 16 而条高只有 24~36pt，
+        // 小图 + capInsets 三段拉伸在这种又矮又扁的条上会差个一两像素，而这一帧是静止的、
+        // 只画一次，没理由去省。动画中间帧照旧用小图（形状在动，逐帧重出真尺寸图没必要）。
+        let fullSize = topRadius < 0.25 && bottomRadius > 1
+        let modeChanged = fullSize != maskUsedFullSize
+        let radiiChanged = abs(topRadius - maskTopRadius) > 0.5 || abs(bottomRadius - maskBottomRadius) > 0.5
+        // 圆角没明显变化就别重做遮罩：maskImage 一换，毛玻璃那块要重算。
+        // 有刘海的主屏上圆角一直是 18，这条判断完全不会触发，逐帧开销为零。
+        guard modeChanged || radiiChanged else { return }
+        maskTopRadius = topRadius
+        maskBottomRadius = bottomRadius
+        maskUsedFullSize = fullSize
+        if fullSize {
+            let size = panel?.frame.size ?? Cfg.capsuleSize
+            let scale = currentScreen().backingScaleFactor
+            let key = "\(Int(size.width))x\(Int(size.height))@\(scale)r\(Int(bottomRadius.rounded()))"
+            if key != fullSizeMaskKey || fullSizeMask == nil {
+                fullSizeMaskKey = key
+                fullSizeMask = Self.notchMask(size: size, radius: bottomRadius, scale: scale)
+            }
+            blur?.maskImage = fullSizeMask
+        } else {
+            blur?.maskImage = Self.panelMask(topRadius: topRadius, bottomRadius: bottomRadius)
+        }
+    }
+
+    /// 折叠时是否藏进刘海（默认开）
+    private var hidesInNotch: Bool {
+        UserDefaults.standard.object(forKey: hidesInNotchKey) as? Bool ?? true
+    }
+
+    @objc private func screenParametersChanged() {
+        guard panel != nil else { return }
+        panel.setFrame(islandFrame(expanded: isExpanded), display: true)
+        applyCollapsedAppearance()
+    }
+
+    // MARK: 快捷键
+
+    private func setupHotKey() {
+        hotKey.onTrigger = { [weak self] in self?.toggleFromKeyboard() }
+
+        let d = UserDefaults.standard
+        hotKeyCode = d.object(forKey: hotKeyCodeKey) as? Int ?? Int(kVK_ANSI_K)
+        hotKeyMods = d.object(forKey: hotKeyModsKey) as? Int ?? Int(cmdKey | optionKey)
+        hotKeyLabel = d.string(forKey: hotKeyLabelKey) ?? "⌥⌘K"
+        recorder.label = hotKeyLabel
+        applyHotKey(code: hotKeyCode, mods: hotKeyMods, label: hotKeyLabel, quiet: true)
+    }
+
+    private func applyHotKey(code: Int, mods: Int, label: String, quiet: Bool = false) {
+        let previous = (hotKeyCode, hotKeyMods, hotKeyLabel)
+
+        if code == 0 || mods == 0 {
+            hotKey.unregister()
+            hotKeyCode = 0
+            hotKeyMods = 0
+            hotKeyLabel = "无"
+            recorder.label = hotKeyLabel
+            persistHotKey()
+            if !quiet { setStatus("已清除全局快捷键") }
+            return
+        }
+
+        if hotKey.register(keyCode: UInt32(code), modifiers: UInt32(mods)) {
+            dbg("hotkey registered: \(label) (code=\(code) mods=\(mods))")
+            hotKeyCode = code
+            hotKeyMods = mods
+            hotKeyLabel = label
+            recorder.label = label
+            persistHotKey()
+            if !quiet { setStatus("快捷键已改为 \(label)") }
+        } else {
+            // 被别的应用占了：还原上一次能用的
+            let restored = hotKey.register(keyCode: UInt32(previous.0), modifiers: UInt32(previous.1))
+            hotKeyCode = previous.0
+            hotKeyMods = previous.1
+            hotKeyLabel = previous.2
+            recorder.label = hotKeyLabel
+            persistHotKey()
+            setStatus(restored ? "✗ \(label) 被其他应用占用，已还原为 \(hotKeyLabel)" : "✗ 快捷键注册失败")
+            setCapsuleNotice("✗ \(label) 被占用")
+        }
+    }
+
+    private func persistHotKey() {
+        let d = UserDefaults.standard
+        d.set(hotKeyCode, forKey: hotKeyCodeKey)
+        d.set(hotKeyMods, forKey: hotKeyModsKey)
+        d.set(hotKeyLabel, forKey: hotKeyLabelKey)
+    }
+
+    private func beginRecordingHotKey() {
+        collapseWork?.cancel()
+        collapseWork = nil
         NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        hotKey.unregister()
+        recorder.beginRecording()
+        setStatus("按下新的组合键 · Esc 取消 · Delete 清除")
+    }
+
+    private func finishRecordingHotKey() {
+        // 录制取消或结束后没注册上，就把原来的装回去
+        if !hotKey.isRegistered {
+            applyHotKey(code: hotKeyCode, mods: hotKeyMods, label: hotKeyLabel, quiet: true)
+        }
+    }
+
+    @objc private func menuEditHotKey() {
+        expand(activateApp: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.beginRecordingHotKey()
+        }
+    }
+
+    @objc func toggleFromKeyboard() {
+        if isExpanded {
+            collapse(animated: true)
+        } else {
+            clearReopenBlock(reason: "快捷键打开")
+            expand(activateApp: true)
+        }
+    }
+
+    // MARK: 菜单动作
+
+    @objc private func menuToggleIsland() {
+        let d = UserDefaults.standard
+        let next = !d.bool(forKey: islandKey)
+        d.set(next, forKey: islandKey)
+        applyIslandVisibility()
+        if next {
+            setStatus("灵动岛胶囊已显示（鼠标移上去展开面板）")
+        } else {
+            setStatus("灵动岛胶囊已隐藏，用菜单栏图标或快捷键打开")
+        }
+    }
+
+    @objc private func menuResetIslandPosition() {
+        resetIslandPosition()
+    }
+
+    @objc private func menuToggleHidesInNotch() {
+        let next = !hidesInNotch
+        UserDefaults.standard.set(next, forKey: hidesInNotchKey)
+        if !isExpanded {
+            panel.setFrame(islandFrame(expanded: false), display: true)
+        }
+        applyCollapsedAppearance()
+        setStatus(next ? "折叠时藏进刘海（鼠标移到刘海就会展开）" : "折叠时显示胶囊")
+    }
+
+    @objc private func menuToggleLoginItem() {
+        let next = !LoginItem.isEnabled
+        if let error = LoginItem.setEnabled(next) {
+            setStatus("✗ 开机启动设置失败：\(error)")
+            if LoginItem.needsApproval {
+                setStatus("请在「系统设置 › 通用 › 登录项」里允许 CloseApps")
+            }
+            return
+        }
+        setStatus(next ? "✓ 已开启开机自动启动" : "已关闭开机自动启动")
+    }
+
+    @objc private func togglePin() {
+        isPinned.toggle()
+        UserDefaults.standard.set(isPinned, forKey: pinKey)
+        applyPinAppearance()
+        setStatus(isPinned ? "✓ 面板已钉住（鼠标移开也不收起）" : "已取消钉住")
+    }
+
+    private func applyPinAppearance() {
+        guard pinButton != nil else { return }
+        pinButton.image = NSImage(systemSymbolName: isPinned ? "pin.fill" : "pin", accessibilityDescription: "钉住")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
+        pinButton.contentTintColor = isPinned ? .controlAccentColor : .secondaryLabelColor
+    }
+
+    @objc private func collapseNow() {
+        collapse(animated: true)
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 
     // MARK: 数据
@@ -584,13 +2819,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 折叠态：只更新数量与授权角标，不碰窗口列表（省电）
+    private func updateCounts() {
+        appCount = visibleApps.count
+        let trusted = axTrusted()
+        titleLabel.stringValue = "正在运行的应用（\(appCount)）"
+        capsuleLabel.stringValue = "\(appCount) 个应用"
+        capsuleBadge.isHidden = trusted
+        authBanner.isHidden = trusted
+        authBannerHeight.constant = trusted ? 0 : 18
+    }
+
+    private func refreshLightweight() {
+        if isExpanded {
+            reload()
+        } else {
+            updateCounts()
+        }
+    }
+
+    private func setCapsuleNotice(_ text: String) {
+        guard capsuleLabel != nil else { return }
+        capsuleNoticeWork?.cancel()
+        capsuleLabel.stringValue = text
+        let item = DispatchWorkItem { [weak self] in self?.updateCounts() }
+        capsuleNoticeWork = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: item)
+    }
+
+    /// 动画期间要跑的重载：AX 查询是**同步 IPC**，某个应用不响应时一卡就是几百毫秒，
+    /// 正巧落在展开那 0.3s 里，画面就会明显顿一下 —— 直接推到动画结束再跑。
+    /// 展开时内容刚刷过一遍，晚这 0.3s 完全看不出来。
     func reload(force: Bool = false) {
+        guard morphDriver == nil else {
+            dbg("reload 推迟：动画进行中（AX 查询会占住主线程）")
+            deferredReload?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.deferredReload = nil
+                self.reload(force: force)      // 还在动画中就再等一会儿
+            }
+            deferredReload = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: work)
+            return
+        }
+        let started = CACurrentMediaTime()
         reloadCounter += 1
         let trusted = axTrusted()
-        authBanner.isHidden = trusted
-        authBannerHeight.isActive = !trusted
-        authBannerHeight.constant = trusted ? 0 : 18
-        if !trusted { authBannerHeight.constant = 18 }
+        appCount = visibleApps.count
 
         let current = visibleApps.sorted {
             ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
@@ -603,6 +2879,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        titleLabel.stringValue = "正在运行的应用（\(current.count)）"
+        capsuleLabel.stringValue = "\(current.count) 个应用"
+        capsuleBadge.isHidden = trusted
+        authBanner.isHidden = trusted
+        authBannerHeight.constant = trusted ? 0 : 18
+
         // 签名：进程集合 + 窗口数量；数量没变时跳过重建（每 10 秒强制重建一次以刷新标题）
         let signature = current.map { "\($0.processIdentifier)|\(windowsByPid[$0.processIdentifier]?.count ?? 0)" }
         let periodic = reloadCounter % 5 == 0
@@ -610,7 +2892,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastSignature = signature
         apps = current
 
-        countLabel.stringValue = "正在运行的应用（\(apps.count)）"
         // 扁平卡片流：应用卡在前，其窗口卡紧随其后（仅显示 ≥2 个窗口的应用，
         // 0/1 个窗口时应用卡已覆盖该窗口，不再额外显示）
         var cards: [NSView] = []
@@ -623,6 +2904,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         cardGrid.setCards(cards)
         emptyLabel.isHidden = !apps.isEmpty
+        let cost = (CACurrentMediaTime() - started) * 1000
+        if cost > 20 {
+            dbg("reload 用时=\(Int(cost))ms（\(apps.count) 个应用，开辅助功能后这里会明显变慢）")
+        }
+    }
+
+    private func startRefresh() {
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: Cfg.refreshInterval, repeats: true) { [weak self] _ in
+            self?.reload()
+        }
+    }
+
+    private func stopRefresh() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
     }
 
     // MARK: 关闭应用（整个进程树）
@@ -652,25 +2949,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: 面板置顶
-
-    @objc private func togglePin() {
-        setPinned(!isPinned)
-    }
-
-    private func setPinned(_ pinned: Bool, silent: Bool = false) {
-        isPinned = pinned
-        window.level = pinned ? .floating : .normal
-        UserDefaults.standard.set(pinned, forKey: pinKey)
-        pinButton.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: "置顶")?
-            .withSymbolConfiguration(.init(pointSize: 14, weight: .medium))
-        pinButton.contentTintColor = pinned ? .controlAccentColor : .secondaryLabelColor
-        pinButton.toolTip = pinned ? "取消置顶" : "面板置顶（始终显示在最前）"
-        if !silent {
-            setStatus(pinned ? "✓ 面板已置顶" : "已取消置顶")
-        }
-    }
-
     // MARK: 其他操作
 
     @objc private func openAXSettings() {
@@ -685,6 +2963,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setStatus(_ text: String) {
+        if !isExpanded {
+            setCapsuleNotice(text)
+            return
+        }
         statusResetItem?.cancel()
         statusLabel.stringValue = text
         let item = DispatchWorkItem { [weak self] in
@@ -698,5 +2980,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 let app = NSApplication.shared
 let controller = AppDelegate()
 app.delegate = controller
-app.setActivationPolicy(.regular)
 app.run()
