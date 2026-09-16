@@ -176,3 +176,26 @@ swift tools/preview_fake_notch.swift      # 输出 /tmp/closeapps-shape-preview.
 每个版本改了什么，都记在 **[CHANGELOG.md](CHANGELOG.md)**。
 
 最近的 **v1.1**（2026-09-16）是「灵动岛」这一版：打开方式从一处扩成三处（灵动岛 / 全局快捷键 / 菜单栏图标），折叠态做到彻底隐形且三种长相形状统一，面板可拖动、展开收起走弹簧动画，滚动条比系统默认细一半。相比 v1.0，`src/main.swift` 从 702 行涨到 2983 行。
+
+## 关注 / 联系
+
+这工具是我（**流佬**）自己日常在用、顺手开源出来的 —— 不是团队产品，一个人维护。
+
+用着有问题、有想法，或者想聊 AI 工具和折腾经历，都欢迎找我：
+
+<table>
+<tr>
+<td align="center" valign="top">
+  <img src="assets/qrcode-official-account.jpg" width="240" alt="微信公众号「流佬」二维码">
+  <br><b>公众号「流佬」</b>
+  <br><sub>AI 工具 / 模型实测与教程</sub>
+</td>
+<td align="center" valign="top">
+  <img src="assets/qrcode-wechat.jpg" width="240" alt="微信「流佬」二维码">
+  <br><b>我的微信</b>
+  <br><sub>扫二维码，添加我为朋友</sub>
+</td>
+</tr>
+</table>
+
+不想加微信的话，直接开 [Issue](../../issues) 说也行。
