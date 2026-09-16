@@ -39,6 +39,14 @@ private enum Cfg {
     /// 收起时鼠标还赖在命中区里 → 先不忙重开，等它挪开；这是最长等待兜底
     static let reopenGuardFallback: TimeInterval = 1.5
     static let refreshInterval: TimeInterval = 2.0
+    /// 检查更新：一个只读的 HTTPS GET，拉 GitHub 上公开的 latest release。
+    /// **不用上架、不用开发者账号、不用任何系统授权**，也不往上报任何本机信息 ——
+    /// 就是个普通网络请求，跟"系统推送通知"完全是两码事。
+    static let updateFeedURL = "https://api.github.com/repos/liulao-space/close-app/releases/latest"
+    static let releasePageURL = "https://github.com/liulao-space/close-app/releases"
+    /// 启动后先忙正事，过一会儿再查；之后每 6 小时一次
+    static let updateCheckDelay: TimeInterval = 6
+    static let updateCheckInterval: TimeInterval = 6 * 3600
     static var detailSize: NSSize {
         NSSize(width: expandedSize.width, height: expandedSize.height - headerHeight)
     }
@@ -956,6 +964,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusLabel: NSTextField!
     private var authBanner: NSButton!
     private var authBannerHeight: NSLayoutConstraint!
+    /// 查到新版本时，挂在授权横幅下面那一行细提示（没有新版就高度 0、完全不存在）
+    private var updateBanner: NSButton!
+    private var updateBannerHeight: NSLayoutConstraint!
     private var pinButton: NSButton!
     private var recorder: HotKeyRecorder!
     private var expandedOnly: [NSView] = []
@@ -1030,6 +1041,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotKeyCodeKey = "hotKeyCode"
     private let hotKeyModsKey = "hotKeyModifiers"
     private let hotKeyLabelKey = "hotKeyLabel"
+    private let checkUpdatesKey = "checkForUpdatesAutomatically"
+    private let lastUpdateCheckKey = "lastUpdateCheckAt"
+    /// 远端查到的新版本（没有就是 nil）
+    private var availableUpdate: (version: String, url: URL)?
+    private var updateTimer: Timer?
 
     private let defaultStatus = "✕ 彻底关闭应用 · 点卡片激活 · 鼠标移开自动收起"
 
@@ -1050,7 +1066,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + "藏刘海=\(hidesInNotchNow(on: currentScreen())) 容器alpha=\(container?.alphaValue ?? -1) 阴影=\(panel?.hasShadow ?? false) "
             + "拖动=\(offsetText()) 重开锁=\(reopenBlocked) 命中区=\(rectText(collapsedHitRect)) "
             + "样式=\(collapsedStyle(on: currentScreen())) 菜单栏高=\(Int(currentScreen().menuBarHeight)) "
-            + "折叠框=\(rectText(islandFrame(expanded: false))) 展开框=\(rectText(islandFrame(expanded: true)))")
+            + "折叠框=\(rectText(islandFrame(expanded: false))) 展开框=\(rectText(islandFrame(expanded: true))) "
+            + "更新=\(availableUpdate.map { "有 \($0.version)" } ?? "无") 自动检查=\(checkUpdatesEnabled) "
+            + "横幅高=\(Int(updateBannerHeight?.constant ?? -1))")
     }
 
     /// 仅调试（stdin 指令 `mask`）：把假刘海的遮罩真的算出来、导出成 PNG、再探四个角的像素。
@@ -1182,6 +1200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // ⑦ 开机启动 / 藏刘海开关
             // ★ 只读：以前这里真的开关一遍开机项，等于把开机项重挂到"当时跑的那份副本"上
             ("check 开机启动（只读）", 9.20, { [weak self] in self?.probeLoginItem() }),
+            ("check 更新检查逻辑", 9.35, { [weak self] in self?.probeUpdateCheck() }),
             ("dump@⑪ 开机启动态", 9.60, { [weak self] in self?.dumpState("⑪ 开机启动态") }),
             ("notch-off", 12.20, { [weak self] in self?.menuToggleHidesInNotch() }),
             ("dump@⑫ 不藏刘海（贴顶胶囊）", 12.80, { [weak self] in self?.dumpState("⑫ 不藏刘海") }),
@@ -1245,6 +1264,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.debugSetFakeCursor(String(line.dropFirst(6)))
                         return
                     }
+                    if line.hasPrefix("fakeupdate ") {
+                        self.simulateUpdateBanner(String(line.dropFirst(11)).trimmingCharacters(in: .whitespaces))
+                        return
+                    }
                     if line.hasPrefix("drag ") {
                         let parts = line.dropFirst(5).split(separator: " ").compactMap { Double($0) }
                         guard parts.count == 2 else { self.dbg("usage: drag <dx> <dy>"); return }
@@ -1263,6 +1286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     case "island": self.menuToggleIsland()
                     case "notch": self.menuToggleHidesInNotch()
                     case "login": self.menuToggleLoginItem()
+                    case "update": self.checkForUpdate(manual: true)
+                    case "update-clear": self.hideUpdateBanner()
                     case "dump": self.dumpState("dump")
                     case "mask": self.dumpMask()
                     case "shape":
@@ -1326,6 +1351,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dbg("launched: screen=\(currentScreen().frame) visible=\(currentScreen().visibleFrame) capsule=\(islandFrame(expanded: false))")
         startDebugConsole()
         runSelfTest()
+        // 自测不联网：网络那步只做人工验证，别让自测结果取决于今天的网通不通
+        if !selfTestEnabled { scheduleUpdateCheck() }
         lastScreenID = currentScreen().displayID
         screenWatchTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.followMouseScreen()
@@ -1361,6 +1388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         dbg("applicationWillTerminate")
         refreshTimer?.invalidate()
+        updateTimer?.invalidate()
         screenWatchTimer?.invalidate()
         stopHoverPoll()
         reopenWatchTimer?.invalidate()
@@ -1585,6 +1613,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         authBanner.alignment = .center
         authBanner.translatesAutoresizingMaskIntoConstraints = false
 
+        updateBanner = NSButton(
+            title: "有新版本可用，点这里查看 →",
+            target: self,
+            action: #selector(openUpdatePage)
+        )
+        updateBanner.font = .systemFont(ofSize: 11, weight: .medium)
+        updateBanner.isBordered = false
+        updateBanner.contentTintColor = .systemBlue
+        updateBanner.alignment = .center
+        updateBanner.isHidden = true
+        updateBanner.translatesAutoresizingMaskIntoConstraints = false
+
         cardGrid = CardGridView(frame: .zero)
         cardGrid.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1610,11 +1650,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         d.addSubview(authBanner)
+        d.addSubview(updateBanner)
         d.addSubview(scroll)
         d.addSubview(emptyLabel)
         d.addSubview(statusLabel)
 
         authBannerHeight = authBanner.heightAnchor.constraint(equalToConstant: 0)
+        updateBannerHeight = updateBanner.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
             authBanner.topAnchor.constraint(equalTo: d.topAnchor, constant: 4),
@@ -1622,7 +1664,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             authBanner.trailingAnchor.constraint(equalTo: d.trailingAnchor, constant: -18),
             authBannerHeight,
 
-            scroll.topAnchor.constraint(equalTo: authBanner.bottomAnchor, constant: 6),
+            updateBanner.topAnchor.constraint(equalTo: authBanner.bottomAnchor, constant: 2),
+            updateBanner.leadingAnchor.constraint(equalTo: d.leadingAnchor, constant: 18),
+            updateBanner.trailingAnchor.constraint(equalTo: d.trailingAnchor, constant: -18),
+            updateBannerHeight,
+
+            scroll.topAnchor.constraint(equalTo: updateBanner.bottomAnchor, constant: 6),
             scroll.leadingAnchor.constraint(equalTo: d.leadingAnchor, constant: 16),
             scroll.trailingAnchor.constraint(equalTo: d.trailingAnchor, constant: -16),
             scroll.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -6),
@@ -1789,6 +1836,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 action: #selector(toggleFromKeyboard), keyEquivalent: "")
         toggle.target = self
         menu.addItem(toggle)
+
+        // 有新版就顶在最上面 —— 菜单栏右键是"不打开面板也能看见"的入口
+        if let update = availableUpdate {
+            let newer = NSMenuItem(title: "↑ 新版本 \(update.version) 可用 · 点击查看",
+                                   action: #selector(openUpdatePage), keyEquivalent: "")
+            newer.target = self
+            menu.addItem(newer)
+        }
         menu.addItem(.separator())
 
         let island = NSMenuItem(title: "显示灵动岛胶囊", action: #selector(menuToggleIsland), keyEquivalent: "")
@@ -1821,6 +1876,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hk = NSMenuItem(title: "修改全局快捷键…", action: #selector(menuEditHotKey), keyEquivalent: "")
         hk.target = self
         menu.addItem(hk)
+
+        let checkUpdate = NSMenuItem(title: "检查更新…", action: #selector(menuCheckUpdate), keyEquivalent: "")
+        checkUpdate.target = self
+        menu.addItem(checkUpdate)
+
+        let autoUpdate = NSMenuItem(title: "自动检查更新", action: #selector(menuToggleCheckUpdates), keyEquivalent: "")
+        autoUpdate.target = self
+        autoUpdate.state = checkUpdatesEnabled ? .on : .off
+        menu.addItem(autoUpdate)
 
         if !axTrusted() {
             let ax = NSMenuItem(title: "辅助功能权限…", action: #selector(openAXSettings), keyEquivalent: "")
@@ -2470,6 +2534,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                      : "✗ 形状不对"))
     }
 
+    /// ★ 「软件自己去看一眼有没有新版」的回归断言：版本比较、JSON 解析、横幅显示。
+    ///
+    /// **不联网** —— 自测不该依赖网络，否则今天网不好就红一片，分不清是代码坏了还是网坏了。
+    /// 真请求那一步单独手工验（`printf 'update\\n' | CLOSEAPPS_DEBUG=1 ...`）。
+    private func probeUpdateCheck() {
+        // 1.10 > 1.9 这条是关键用例：用字符串比会判成 false
+        let cases: [(String, String, Bool)] = [
+            ("1.1.1", "1.1", true),
+            ("1.1", "1.1", false),
+            ("1.1", "1.1.1", false),
+            ("1.10", "1.9", true),
+            ("2.0", "1.9.9", true),
+            ("1.9.9", "2.0", false),
+        ]
+        let wrong = cases.filter { versionIsNewer($0.0, than: $0.1) != $0.2 }
+        let versionOK = wrong.isEmpty
+
+        let sample = Data(#"{"tag_name":"v9.9.9","html_url":"https://github.com/liulao-space/close-app/releases/tag/v9.9.9"}"#.utf8)
+        let parsed = parseUpdateFeed(sample)
+        let parseOK = parsed?.version == "9.9.9" && (parsed?.url.absoluteString.hasSuffix("/v9.9.9") ?? false)
+        let garbageOK = parseUpdateFeed(Data("not json at all".utf8)) == nil
+
+        simulateUpdateBanner("9.9.9")
+        let shownOK = !updateBanner.isHidden && updateBannerHeight.constant > 0
+        hideUpdateBanner()
+        let hiddenOK = updateBanner.isHidden && updateBannerHeight.constant == 0
+
+        let ok = versionOK && parseOK && garbageOK && shownOK && hiddenOK
+        dbg("更新检查: 当前版本=\(currentVersion) 版本比较=\(versionOK ? "6 例全过" : "✗ \(wrong.count) 例判错")"
+            + " 解析=\(parseOK ? "✓" : "✗") 坏数据不崩=\(garbageOK ? "✓" : "✗")"
+            + " 横幅显示=\(shownOK ? "✓" : "✗") 收起=\(hiddenOK ? "✓" : "✗")"
+            + " 自动检查=\(checkUpdatesEnabled ? "开" : "关")"
+            + " " + (ok ? "✓ 逻辑与横幅都对（真网络请求不在自测里跑）" : "✗ 有问题"))
+    }
+
     /// ★ 滚动条宽度的回归断言。
     ///
     /// 宽度是 `NSScroller` 的**类方法**算的，所以"换了子类"还不算数 —— 得看 NSScrollView
@@ -2960,6 +3059,143 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func manualRefresh() {
         reload(force: true)
         setStatus("已刷新")
+    }
+
+    // MARK: 检查更新
+
+    /// 当前版本，取自 Info.plist，跟 release tag 对得上
+    private var currentVersion: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0"
+    }
+
+    private var checkUpdatesEnabled: Bool {
+        UserDefaults.standard.object(forKey: checkUpdatesKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: checkUpdatesKey)
+    }
+
+    /// 按 `.` 分段逐位比数字。
+    ///
+    /// ⚠️ 千万别图省事用字符串比：字典序里 `"1.10" < "1.9"`（'1' 比 '9' 小），
+    /// 版本号就会卡在 1.9 再也涨不到 1.10 —— 这种 bug 要等到真发 1.10 那天才炸。
+    private func versionIsNewer(_ remote: String, than local: String) -> Bool {
+        let a = remote.split(separator: ".").map { Int($0) ?? 0 }
+        let b = local.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0
+            let y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    /// 从 GitHub `releases/latest` 的响应里取出（版本号, 页面地址）。
+    /// 抽成独立函数是为了自测能喂假 JSON —— 不用联网也能验解析。
+    private func parseUpdateFeed(_ data: Data) -> (version: String, url: URL)? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = obj["tag_name"] as? String, !tag.isEmpty else { return nil }
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let link = (obj["html_url"] as? String).flatMap(URL.init(string:))
+            ?? URL(string: Cfg.releasePageURL)
+        guard let link else { return nil }
+        return (version, link)
+    }
+
+    /// 启动后延迟查一次，之后每 6 小时一次。
+    private func scheduleUpdateCheck() {
+        guard checkUpdatesEnabled else {
+            dbg("更新检查: 用户关掉了自动检查，跳过")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Cfg.updateCheckDelay) { [weak self] in
+            self?.checkForUpdate()
+        }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: Cfg.updateCheckInterval, repeats: true) { [weak self] _ in
+            self?.checkForUpdate()
+        }
+    }
+
+    /// `manual = true`（菜单点的）：成功失败都给一句回话。
+    /// 自动那次全程静默 —— 查不到就当没这回事，绝不打扰。
+    private func checkForUpdate(manual: Bool = false) {
+        guard let url = URL(string: Cfg.updateFeedURL) else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        // GitHub 要求带 User-Agent；顺便把自家版本报过去，人家也是这么干的
+        req.setValue("CloseApps/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastUpdateCheckKey)
+        if manual { setStatus("正在检查更新…") }
+        dbg("更新检查: 发起请求（\(manual ? "手动" : "自动")）\(url.absoluteString)")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+            guard let self else { return }
+            let parsed = data.flatMap { self.parseUpdateFeed($0) }
+            DispatchQueue.main.async {
+                self.applyUpdateResult(parsed, error: error, manual: manual)
+            }
+        }.resume()
+    }
+
+    private func applyUpdateResult(_ parsed: (version: String, url: URL)?, error: Error?, manual: Bool) {
+        guard let parsed else {
+            dbg("更新检查: 没拿到结果（\(error?.localizedDescription ?? "响应里没有 tag_name")）")
+            if manual { setStatus("检查更新失败，稍后再试") }
+            return
+        }
+        if versionIsNewer(parsed.version, than: currentVersion) {
+            dbg("更新检查: 有新版本 \(parsed.version)（当前 \(currentVersion)）→ \(parsed.url.absoluteString)")
+            showAvailableUpdate(version: parsed.version, url: parsed.url)
+            if manual { setStatus("发现新版本 \(parsed.version)") }
+        } else {
+            dbg("更新检查: 已是最新（远端 \(parsed.version) / 当前 \(currentVersion)）")
+            hideUpdateBanner()
+            if manual { setStatus("已是最新版本 \(currentVersion)") }
+        }
+    }
+
+    /// 横幅一出现就常驻（不是弹窗，只有用户主动打开面板才看得见，所以不需要限频）；
+    /// 真正要限频的是**网络请求**，那个由 `updateCheckInterval` 管。
+    private func showAvailableUpdate(version: String, url: URL) {
+        availableUpdate = (version, url)
+        updateBanner.title = "新版本 \(version) 可用，点这里查看 →"
+        updateBanner.isHidden = false
+        updateBannerHeight.constant = 18
+    }
+
+    private func hideUpdateBanner() {
+        availableUpdate = nil
+        updateBanner.isHidden = true
+        updateBannerHeight.constant = 0
+    }
+
+    @objc private func openUpdatePage() {
+        guard let update = availableUpdate else { return }
+        NSWorkspace.shared.open(update.url)
+        dbg("更新检查: 已在浏览器打开 \(update.url.absoluteString)")
+    }
+
+    @objc private func menuCheckUpdate() { checkForUpdate(manual: true) }
+
+    @objc private func menuToggleCheckUpdates() {
+        let now = !checkUpdatesEnabled
+        UserDefaults.standard.set(now, forKey: checkUpdatesKey)
+        updateTimer?.invalidate()
+        updateTimer = nil
+        if now {
+            scheduleUpdateCheck()
+            setStatus("已开启自动检查更新")
+        } else {
+            setStatus("已关闭自动检查更新")
+        }
+        dbg("更新检查: 自动检查 -> \(now ? "开" : "关")")
+    }
+
+    /// 仅调试（stdin `fakeupdate 9.9.9`）：不联网也能把横幅逼出来看长相
+    private func simulateUpdateBanner(_ version: String) {
+        guard !version.isEmpty, let url = URL(string: Cfg.releasePageURL) else { return }
+        showAvailableUpdate(version: version, url: url)
+        dbg("更新检查: 假数据置入横幅 \(version)（高=\(updateBannerHeight.constant) 隐藏=\(updateBanner.isHidden)）")
     }
 
     private func setStatus(_ text: String) {
