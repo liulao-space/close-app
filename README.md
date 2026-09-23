@@ -53,18 +53,7 @@ cd close-app && ./build.sh && open CloseApps.app
 ./tools/release.sh v1.3.0 "本次更新说明"   # 构建→DMG→签名→appcast→推送→GitHub Release 一条龙
 ```
 
-图标由脚本生成：`./tools/make_icon.sh`。
-
-## 文件结构
-
-```
-src/main.swift    全部源码（纯 AppKit 单文件：灵动岛 + 卡片 + 快捷键 + 登录项 + 更新）
-src/Info.plist    应用描述（LSUIElement 常驻后台）
-build.sh          构建；tools/release.sh  一键发版；tools/make_icon.sh  生成图标
-assets/           图标与 README 截图；signing/  签名材料（不入库）
-```
-
-每个版本的变更见 **[CHANGELOG.md](CHANGELOG.md)**。
+图标由脚本生成：`./tools/make_icon.sh`。每个版本的变更见 **[CHANGELOG.md](CHANGELOG.md)**。
 
 ## 关注 / 联系
 
