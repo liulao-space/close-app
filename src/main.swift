@@ -3,6 +3,7 @@ import ApplicationServices
 import Carbon
 import Darwin
 import ServiceManagement
+import Sparkle
 
 // MARK: - 常量
 
@@ -1043,6 +1044,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotKeyLabelKey = "hotKeyLabel"
     private let checkUpdatesKey = "checkForUpdatesAutomatically"
     private let lastUpdateCheckKey = "lastUpdateCheckAt"
+    /// Sparkle 应用内更新（横幅点击 → 下载替换重启）
+    private var updaterController: SPUStandardUpdaterController?
     /// 远端查到的新版本（没有就是 nil）
     private var availableUpdate: (version: String, url: URL)?
     private var updateTimer: Timer?
@@ -1287,6 +1290,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     case "notch": self.menuToggleHidesInNotch()
                     case "login": self.menuToggleLoginItem()
                     case "update": self.checkForUpdate(manual: true)
+                    case "sparkle":
+                        self.dbg("sparkle: 前台检查更新")
+                        self.updaterController?.checkForUpdates(nil)
                     case "update-clear": self.hideUpdateBanner()
                     case "dump": self.dumpState("dump")
                     case "mask": self.dumpMask()
@@ -1333,6 +1339,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Sparkle 应用内更新：SUEnableAutomaticChecks=false，平时完全静默，
+        // 更新横幅点击时才前台检查并「下载 → 替换 → 重启」一条龙
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
+        )
         if UserDefaults.standard.object(forKey: islandKey) == nil {
             UserDefaults.standard.set(true, forKey: islandKey)
         }
@@ -3171,6 +3182,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openUpdatePage() {
         guard let update = availableUpdate else { return }
+        // 优先走 Sparkle 应用内升级（下载→替换→重启）；
+        // updater 不可用时退回浏览器打开发布页
+        if let controller = updaterController {
+            dbg("更新检查: 走 Sparkle 应用内升级")
+            controller.checkForUpdates(nil)
+            return
+        }
         NSWorkspace.shared.open(update.url)
         dbg("更新检查: 已在浏览器打开 \(update.url.absoluteString)")
     }
