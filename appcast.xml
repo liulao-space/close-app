@@ -1,0 +1,20 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+<channel>
+<title>CloseApps 应用关闭面板</title>
+<link>https://github.com/liulao-space/close-app</link>
+<description>CloseApps 更新分发</description>
+<language>zh</language>
+<item>
+<title>Version 1.2.0</title>
+<pubDate>Wed, 23 Sep 2026 11:25:47 +0800</pubDate>
+<sparkle:version>4</sparkle:version>
+<sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
+<sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
+<enclosure url="https://github.com/liulao-space/close-app/releases/download/v1.2.0/CloseApps.dmg" sparkle:edSignature="5/tycYi1wuySegJHb6hs2Zjh1gFhuFUDDGfDu+7NEixXOz53c5ncWfXhEUFYFUnTUt9D0qiE3Mp5Uac8dh0TDg==" sparkle:version="4" sparkle:shortVersionString="1.2.0" length="1876618" type="application/x-apple-diskimage"/>
+<description><![CDATA[
+<p>接入 Sparkle 应用内自动更新。</p>
+]]></description>
+</item>
+</channel>
+</rss>
