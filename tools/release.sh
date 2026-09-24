@@ -20,7 +20,7 @@ APP_NAME="CloseApps.app"
 # ── 0. 校验 ─────────────────────────────────────────────
 PLIST_V=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" src/Info.plist)
 if [ "$PLIST_V" != "$VERSION" ]; then
-  echo "错误: src/Info.plist 版本($PLIST_V) != $VERSION。先升版本号再发版。" >&2
+  echo "错误: src/Info.plist 版本($PLIST_V) != ${VERSION}。先升版本号再发版。" >&2
   exit 1
 fi
 git diff --quiet || { echo "错误: 工作区有未提交改动，先提交。"; exit 1; }
@@ -53,7 +53,7 @@ rm -rf "$STAGE"
 
 # ── 3. EdDSA 签名 + 重新生成 appcast.xml ────────────────
 KEY="signing/sparkle_ed25519.key"
-[ -f "$KEY" ] || { echo "错误: 找不到 $KEY（Sparkle 私钥）"; exit 1; }
+[ -f "$KEY" ] || { echo "错误: 找不到 ${KEY}（Sparkle 私钥）"; exit 1; }
 SIG_LINE=$("$SIGN_UPDATE" -f "$KEY" "$APP_NAME.dmg")
 SIG=$(echo "$SIG_LINE" | grep -o 'edSignature="[^"]*"' | cut -d'"' -f2)
 LEN=$(echo "$SIG_LINE" | grep -o 'length="[0-9]*"' | grep -o '[0-9]*')
@@ -84,7 +84,7 @@ EOF
 
 # ── 4. 提交推送 + Release ───────────────────────────────
 git add appcast.xml
-git commit -m "$TAG appcast（build $BUILD）"
+git commit -m "$TAG appcast（build ${BUILD}）"
 git push origin main
 gh release create "$TAG" "$APP_NAME.dmg" \
   --title "CloseApps $TAG" \
