@@ -8,14 +8,21 @@
 #      是 Sparkle 更新签名私钥（两者都不在仓库里，换机器要手动带过去）
 #
 # 用法：
-#   ./tools/release.sh v1.3.0 "本次更新的一句话说明"
+#   ./tools/release.sh v1.3.0 "详细更新说明（Markdown，进 Release 正文和 appcast）" "一句话标题"
+#   第三个参数可省略，默认 "CloseApps <tag>"。
+#   ⚠️ 变量后面紧跟全角标点要写成 ${VAR}，否则 bash 会把标点字节吃进变量名，
+#      在 set -u 下报 unbound variable。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TAG="${1:?用法: ./tools/release.sh vX.Y.Z [发布说明]}"
+TAG="${1:?用法: ./tools/release.sh vX.Y.Z [发布说明] [一句话标题]}"
 NOTES="${2:-}"
+TITLE="${3:-CloseApps ${TAG}}"
 VERSION="${TAG#v}"
 APP_NAME="CloseApps.app"
+# 发行的 DMG 文件名。README 里写给用户的是 CloseApps.dmg，
+# 别写成 "$DMG_NAME"（那会变成 CloseApps.app.dmg，跟历史版本和 README 都对不上）。
+DMG_NAME="CloseApps.dmg"
 
 # ── 0. 校验 ─────────────────────────────────────────────
 PLIST_V=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" src/Info.plist)
@@ -45,21 +52,21 @@ fi
 
 # ── 2. 构建 + DMG ───────────────────────────────────────
 ./build.sh
-rm -f "$APP_NAME.dmg"
+rm -f "$DMG_NAME"
 STAGE=$(mktemp -d)
 cp -R "$APP_NAME" "$STAGE/" && ln -s /Applications "$STAGE/Applications"
-hdiutil create -volname CloseApps -srcfolder "$STAGE" -ov -format UDZO "$APP_NAME.dmg" >/dev/null
+hdiutil create -volname CloseApps -srcfolder "$STAGE" -ov -format UDZO "$DMG_NAME" >/dev/null
 rm -rf "$STAGE"
 
 # ── 3. EdDSA 签名 + 重新生成 appcast.xml ────────────────
 KEY="signing/sparkle_ed25519.key"
 [ -f "$KEY" ] || { echo "错误: 找不到 ${KEY}（Sparkle 私钥）"; exit 1; }
-SIG_LINE=$("$SIGN_UPDATE" -f "$KEY" "$APP_NAME.dmg")
+SIG_LINE=$("$SIGN_UPDATE" -f "$KEY" "$DMG_NAME")
 SIG=$(echo "$SIG_LINE" | grep -o 'edSignature="[^"]*"' | cut -d'"' -f2)
 LEN=$(echo "$SIG_LINE" | grep -o 'length="[0-9]*"' | grep -o '[0-9]*')
 BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" src/Info.plist)
 DATE=$(date "+%a, %d %b %Y %H:%M:%S %z")
-ENCLOSURE="https://github.com/liulao-space/close-app/releases/download/$TAG/$APP_NAME.dmg"
+ENCLOSURE="https://github.com/liulao-space/close-app/releases/download/$TAG/$DMG_NAME"
 
 cat > appcast.xml <<EOF
 <?xml version="1.0" standalone="yes"?>
@@ -86,8 +93,8 @@ EOF
 git add appcast.xml
 git commit -m "$TAG appcast（build ${BUILD}）"
 git push origin main
-gh release create "$TAG" "$APP_NAME.dmg" \
-  --title "CloseApps $TAG" \
+gh release create "$TAG" "$DMG_NAME" \
+  --title "$TITLE" \
   --notes "${NOTES:-Version $VERSION}"
 
 echo ""
