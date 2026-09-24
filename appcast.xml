@@ -7,11 +7,11 @@
 <language>zh</language>
 <item>
 <title>Version 1.2.1</title>
-<pubDate>Thu, 24 Sep 2026 12:03:58 +0800</pubDate>
+<pubDate>Thu, 24 Sep 2026 12:05:37 +0800</pubDate>
 <sparkle:version>5</sparkle:version>
 <sparkle:shortVersionString>1.2.1</sparkle:shortVersionString>
 <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
-<enclosure url="https://github.com/liulao-space/close-app/releases/download/v1.2.1/CloseApps.app.dmg" sparkle:edSignature="0HupBzvtzbQRY7kvkzO8wBkLmrKPjtPM4NBGcn9StHSIy+SXFJ128uNezsHQzSVIry5UnkjLO7937+BJ9yyyCw==" sparkle:version="5" sparkle:shortVersionString="1.2.1" length="1935973" type="application/x-apple-diskimage"/>
+<enclosure url="https://github.com/liulao-space/close-app/releases/download/v1.2.1/CloseApps.dmg" sparkle:edSignature="YP7GlWD/HOalkfx5nLOHXgu8qcbo5Ip4r6OGH+MqjKj4Ft2kb0sZQZbRojgLNfcHa0vR+hTCGO+BfK2iJLfgCg==" sparkle:version="5" sparkle:shortVersionString="1.2.1" length="1935975" type="application/x-apple-diskimage"/>
 <description><![CDATA[<p>## 修复
 
 - 别的桌面上的窗口现在也能列出来了（Chrome / Edge / VSCode / 微信这类应用）
