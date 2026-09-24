@@ -71,22 +71,299 @@ final class WinInfo {
 
 private func axTrusted() -> Bool { AXIsProcessTrusted() }
 
-private func axWindows(for app: NSRunningApplication) -> [WinInfo] {
-    let appRef = AXUIElementCreateApplication(app.processIdentifier)
-    var out: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &out) == .success,
-          let windows = out as? [AXUIElement] else { return [] }
-    var result: [WinInfo] = []
-    for w in windows {
-        var t: CFTypeRef?
-        var title = ""
-        if AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &t) == .success,
-           let s = t as? String {
-            title = s
+// MARK: - 跨桌面取窗口（本项目唯一用到私有 API 的地方）
+
+/// ⚠️ 下面两个是 CloseApps 用到的**唯一两个私有 API**，只为了一件事：**把藏在别的桌面上的窗口捞出来**。
+///
+/// 公开 API 做不到，这是实测出来的边界（2026-09-24，两条轴分别对照过）：
+///   · `kAXWindows` **只返回「当前正在显示的那个桌面」上的窗口**。Chromium 系（VSCode / Chrome /
+///     一切 Electron）尤其严格：窗口不在当前桌面时它返回**空数组**，连窗口标题都拿不到。
+///   · **换屏不影响**：一个窗口在主屏、一个在外接屏（两块屏都能看见）时，两个都列得出来。
+///   · **应用是不是前台不影响**。真正的开关是「这个窗口所在的桌面当前有没有被显示」。
+///     所以你在一块屏顶部唤出面板时，另一块屏"别的桌面"里的窗口，面板一个都看不见 ——
+///     这就是「两个窗口只显示一个」的来源。
+///   · **最小化不影响**（最小化的窗口照样列出来）。
+///
+/// 两条补救路径（做法与开源项目 alt-tab-macos 一致，它靠这套在多显示器 + 多桌面上列全窗口）：
+///   ① `kAXFocusedWindow` / `kAXMainWindow`：AppKit **没有**把这两个属性挂到"仅当前桌面"的过滤上，
+///      所以窗口在别的桌面时，它俩是唯一还肯交出东西的入口 —— 而且是同一次 IPC，不额外花时间。
+///   ② `_AXUIElementCreateWithRemoteToken` + 枚举元素 ID：用「pid + magic + 元素 ID」拼一个远程令牌，
+///      挨个 ID 去试，就能拿到 `kAXWindows` 之外的窗口元素（跨桌面窗口、非活动标签页都在此列）。
+///      这是唯一途径。代价是要扫 ID（实测 ~11µs/个），所以**只在面板展开时、后台低优先级地扫**。
+@_silgen_name("_AXUIElementCreateWithRemoteToken")
+private func _AXUIElementCreateWithRemoteToken(_ token: CFData) -> Unmanaged<AXUIElement>?
+
+/// 从 AX 元素反查它的 CGWindowID —— 用来跨来源去重、以及跟系统窗口列表对齐。
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+private func axValue(_ e: AXUIElement, _ key: String) -> CFTypeRef? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(e, key as CFString, &v) == .success else { return nil }
+    return v
+}
+
+private func axText(_ e: AXUIElement, _ key: String) -> String {
+    (axValue(e, key) as? String) ?? ""
+}
+
+private func axWindowID(_ e: AXUIElement) -> CGWindowID? {
+    var w = CGWindowID(0)
+    guard _AXUIElementGetWindow(e, &w) == .success, w != 0 else { return nil }
+    return w
+}
+
+/// 判定「这是个真窗口」。要筛掉的是两类假货：
+///   ① `kAXWindows` 里混进来的代理元素（访达实测有一个 subrole 为空、没有关闭按钮的条目）
+///   ② 系统窗口列表里的隐藏辅助窗（Chrome 的 1930×139、微信的 635×892，都是 AXUnknown 且没有关闭按钮）
+/// 判据取「标准窗口子角色 **或** 带关闭按钮」—— 实测 6 个应用、9 个窗口全部吻合，没有误伤。
+private func axIsRealWindow(_ e: AXUIElement) -> Bool {
+    guard axText(e, kAXRoleAttribute as String) == "AXWindow" else { return false }
+    if axText(e, kAXSubroleAttribute as String) == "AXStandardWindow" { return true }
+    return axValue(e, kAXCloseButtonAttribute as String) != nil
+}
+
+/// 窗口元素上有没有关闭按钮 —— 比 `axIsRealWindow` 更严一档。
+/// 用来区分「读不到标题的真窗口」（微信那个 700×640：三个按钮齐全）和
+/// 「读不到标题的假货」（同应用的 635×892：sub=AXUnknown、一个按钮都没有）。
+private func axHasCloseButton(_ e: AXUIElement) -> Bool {
+    axValue(e, kAXCloseButtonAttribute as String) != nil
+}
+
+/// 系统窗口列表里「像真窗口」的窗口 ID（层 0 + 尺寸不像工具条）。
+/// 条件故意放得很松：它只用来判断"是不是还有窗口没被 AX 交出来"，
+/// 多报几个 ID 的代价只是多试几次，真正的把关在 `axIsRealWindow`。
+private func cgCandidateWindowIDs() -> [pid_t: Set<CGWindowID>] {
+    var map: [pid_t: Set<CGWindowID>] = [:]
+    guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+        return map
+    }
+    for w in list {
+        guard let pid = w[kCGWindowOwnerPID as String] as? pid_t,
+              (w[kCGWindowLayer as String] as? Int) == 0,
+              let box = w[kCGWindowBounds as String] as? [String: Any],
+              let sw = box["Width"] as? Double, let sh = box["Height"] as? Double,
+              sw >= 200, sh >= 120,
+              let num = w[kCGWindowNumber as String] as? Int else { continue }
+        map[pid, default: []].insert(CGWindowID(num))
+    }
+    return map
+}
+
+private struct BruteForceResult {
+    var elements: [AXUIElement] = []
+    var scanned = 0
+    var elapsedMs: Double = 0
+    var remaining: Set<CGWindowID> = []
+    /// 本轮见到的**最大有效元素 ID** —— 用来判断扫描上界要不要往外扩。
+    var maxValidID: UInt64 = 0
+}
+
+/// 暴力枚举一个进程的元素 ID，把 `wanted` 里那些窗口的 AX 元素找出来。
+/// ⚠️ 必须在**后台线程**跑（会占住调用线程几十毫秒）。跨进程的 AX 调用不要求主线程。
+///
+/// ★★ 扫描上界必须按**固定值**（`ceilID`）扫，**绝对不要**改成"连续 N 个 ID 取不到元素就停"。
+/// 踩过的坑：元素 ID 空间里存在**很大的空洞**。实测微信 20 个有效元素分布在 46~706，
+/// 其中 `333 → 703` 之间就空了 **370** 个 ID；当时用"连续 300 落空即停"，扫到 334 就收工，
+/// 把 703/704/706 三个元素整个漏掉 —— 而 703 正是用户要看的那扇窗口
+/// （700×640、subrole=AXStandardWindow），表现就是"窗口明明开着，面板不显示"。
+/// 按 3000 的上界扫只要 41ms（13.8µs/个 ID），快且不会漏；真遇到元素特别多的应用，
+/// 由 `hiddenWindowElements` 里的"顶到边界就翻倍"逻辑自动外扩。
+private func bruteForceWindowElements(pid: pid_t, wanted: Set<CGWindowID>,
+                                      ceilID: UInt64, budgetMs: Double) -> BruteForceResult {
+    var result = BruteForceResult(remaining: wanted)
+    guard !wanted.isEmpty, let token = CFDataCreateMutable(kCFAllocatorDefault, 20) else { return result }
+    CFDataSetLength(token, 20)
+    guard let bytes = CFDataGetMutableBytePtr(token) else { return result }
+    // 20 字节令牌：pid(4) + 0(4) + magic "coco"(4) + 元素 ID(8)，字节序不能错
+    memset(bytes, 0, 20)
+    var pidField = pid
+    memcpy(bytes, &pidField, 4)
+    var magic = Int32(0x636f636f)
+    memcpy(bytes + 8, &magic, 4)
+
+    let started = CACurrentMediaTime()
+    let deadline = started + budgetMs / 1000
+    var id: UInt64 = 0
+    while id < ceilID, CACurrentMediaTime() < deadline {
+        var idField = id
+        memcpy(bytes + 12, &idField, 8)
+        result.scanned += 1
+        if let e = _AXUIElementCreateWithRemoteToken(token)?.takeRetainedValue(),
+           let w = axWindowID(e) {
+            result.maxValidID = max(result.maxValidID, id)
+            if result.remaining.contains(w), axIsRealWindow(e) {
+                result.elements.append(e)
+                result.remaining.remove(w)
+                if result.remaining.isEmpty { break }
+            }
         }
-        var m: CFTypeRef?
-        let minimized = AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute as CFString, &m) == .success
-            && (m as? Bool ?? false)
+        id += 1
+    }
+    result.elapsedMs = (CACurrentMediaTime() - started) * 1000
+    return result
+}
+
+/// 面板展开时才扫（收起时不做无谓的 IPC 扫描）。由 PanelController 在 expand/collapse 里维护。
+private var panelIsExpandedForScan = false
+/// 扫描结果缓存：pid → (扫完的时刻, 已捞到的窗口元素, 本轮用的扫描上界)。
+/// TTL 内直接用，避免每 2 秒重扫一遍。
+private var hiddenWindowCache: [pid_t: (stamp: TimeInterval, elements: [CGWindowID: AXUIElement], ceil: UInt64)] = [:]
+private var hiddenScanInFlight: Set<pid_t> = []
+/// 单次扫描的**防呆上限**（正常用不到 —— 3000 个 ID 实测只要 41ms）。
+private let hiddenScanBudgetMs: Double = 1500
+/// 元素 ID 的扫描上界起点。实测微信的元素 ID 空间只到 706（20 个有效元素、最大空洞 370 个 ID）。
+private let hiddenScanStartCeil: UInt64 = 3000
+/// 元素 ID 的绝对上限：某轮发现有效元素顶到了上界附近 → 上界翻倍（最多翻到这里）。
+private let hiddenScanMaxCeil: UInt64 = 48000
+/// 「顶到边界」的判定余量：本轮最大有效 ID 离上界比这还近，就认为元素空间没扫完。
+private let hiddenScanEdgeSlack: UInt64 = 500
+/// 扫描结果的保鲜期。**过期只是"该重扫了"，绝不影响继续使用旧结果**（见 hiddenWindowElements）。
+private let hiddenCacheTTL: TimeInterval = 3
+/// 跨桌面扫描完成后的回调（由 PanelController 在 `expand()` 里挂上）。有了它，
+/// 捞回来的窗口**当轮就能上屏**，不用等下一个 2 秒刷新 tick ——
+/// 否则表现就是"面板刚打开时少一个窗口，过两秒自己冒出来"。
+private var hiddenScanDidFinish: (() -> Void)?
+
+/// 清掉已经不在运行的应用留下的缓存（长期挂着不清理会越攒越多）
+private func pruneHiddenWindowCache(keeping pids: Set<pid_t>) {
+    hiddenWindowCache = hiddenWindowCache.filter { pids.contains($0.key) }
+}
+
+/// 顶层作用域里 `PanelController.dbg`（私有方法）够不着，跨桌面扫描这条线单独走一个。
+private let scanDebugEnabled = ProcessInfo.processInfo.environment["CLOSEAPPS_DEBUG"] == "1"
+private func dbgScan(_ message: String) {
+    guard scanDebugEnabled else { return }
+    FileHandle.standardError.write(Data(("[closeapps] " + message + "\n").utf8))
+}
+
+/// 拿「藏在别的桌面上的窗口」元素。
+///
+/// ⚠️⚠️ 这段是**纠错过一次**的，动它之前先读完：
+///
+/// 旧写法在「缓存过期」那一轮直接 `return []`，要等后台扫完、再等下一轮刷新才补上。
+/// 而 TTL(6s) 是刷新间隔(2s)的整数倍 → **面板每 6 秒必然"掉一次窗口卡"**，下一轮再长回来。
+/// 用户看到的就是「微信明明两个窗口，有时候显示两个、有时候只显示一个」。
+///
+/// 现在的语义是 **stale-while-revalidate**：旧结果一直用，只有拿到新结果才替换。
+/// 任何时候都不会因为"正在后台刷新"而少给窗口。
+///
+/// 另：缓存里存的元素可能已经被关掉了 / 窗口重建换了 CGWindowID，所以**仍然按
+/// `missing` 校验**（不在缺席名单里的不返回，免得和 `kAXWindows` 已经给出的重复）。
+private func hiddenWindowElements(pid: pid_t, missing: Set<CGWindowID>) -> [AXUIElement] {
+    guard !missing.isEmpty else { return [] }
+    let now = CACurrentMediaTime()
+    let cached = hiddenWindowCache[pid]
+    let isFresh = cached.map { now - $0.stamp < hiddenCacheTTL } ?? false
+    if !isFresh, panelIsExpandedForScan, !hiddenScanInFlight.contains(pid) {
+        hiddenScanInFlight.insert(pid)
+        let ceilBefore = cached?.ceil ?? hiddenScanStartCeil
+        DispatchQueue.global(qos: .utility).async {
+            let r = bruteForceWindowElements(pid: pid, wanted: missing, ceilID: ceilBefore,
+                                             budgetMs: hiddenScanBudgetMs)
+            DispatchQueue.main.async {
+                hiddenScanInFlight.remove(pid)
+                // 每轮都从 0 扫到上界（= 元素全集）→ 整份替换，
+                // 顺手清掉已关闭窗口留在缓存里的陈旧元素
+                var fresh: [CGWindowID: AXUIElement] = [:]
+                for e in r.elements {
+                    if let w = axWindowID(e) { fresh[w] = e }
+                }
+                // 有效元素顶到了上界附近 → 这应用的元素空间比当前上界大，翻倍续扫
+                var nextCeil = ceilBefore
+                if r.maxValidID + hiddenScanEdgeSlack >= ceilBefore, ceilBefore < hiddenScanMaxCeil {
+                    nextCeil = min(hiddenScanMaxCeil, ceilBefore * 2)
+                    dbgScan("hidden: 「pid \(pid)」元素 ID 顶到 \(r.maxValidID)（上界 \(ceilBefore)）→ 上界扩到 \(nextCeil)")
+                }
+                hiddenWindowCache[pid] = (CACurrentMediaTime(), fresh, nextCeil)
+                // 当轮就刷：不然新捞到的窗口要等下一个 2 秒 tick 才上屏
+                hiddenScanDidFinish?()
+            }
+        }
+    }
+    // ★ 返回缓存里的**全部**元素，**不按 `missing` 过滤**。
+    // 原因：CGWindowID 会变 —— 实测微信同一个 700×640 的窗口，先后来过 336 和 26670。
+    // 按 ID 过滤的话，窗口每次重建都会让缓存里的它"凭空消失一轮再长回来"，又是一次抖动。
+    // 重复的问题由 `axWindows` 里按 CGWindowID 去重兜住（`kAXWindows` 交出来的排在前面、
+    // 优先保留）；元素失效（窗口已关）则由"标题为空"那条过滤兜住。
+    return cached.map { Array($0.elements.values) } ?? []
+}
+
+private func axWindows(for app: NSRunningApplication, cgCandidates: Set<CGWindowID> = []) -> [WinInfo] {
+    let appRef = AXUIElementCreateApplication(app.processIdentifier)
+    // ⚠️⚠️ 这一行是必须的：AX 的**默认消息超时是 6 秒**，而 `reload()` 是在**主线程**上
+    // 挨个应用同步查窗口的 —— 只要有一个应用那一瞬间不响应（实测「活动监视器」1155ms，
+    // 最坏一次把整次 reload 拖到 **6822ms**），面板就是**真的卡住**：动画走完了，
+    // 但内容不刷新、点不动，用户只会觉得"这软件卡了"。
+    // 卡一个上限之后，不响应的应用会**快速失败**（返回错误 → 当作没有窗口），
+    // 代价只是这一个应用暂时不展开窗口卡，换来面板永远秒开。
+    AXUIElementSetMessagingTimeout(appRef, 0.3)
+
+    // 一次 IPC 把三个属性一起取回来（分开取是三次 IPC，白白多花两倍时间）：
+    //   [0] kAXWindows        —— 只含当前显示的桌面上的窗口
+    //   [1] kAXFocusedWindow  —— AppKit 没把这两个挂到"仅当前桌面"的过滤上，
+    //   [2] kAXMainWindow        窗口藏在别的桌面时，靠它俩还能捞回主窗口/焦点窗口
+    var elements: [AXUIElement] = []
+    var values: CFArray?
+    let keys = [kAXWindowsAttribute, kAXFocusedWindowAttribute, kAXMainWindowAttribute] as CFArray
+    if AXUIElementCopyMultipleAttributeValues(appRef, keys, [], &values) == .success,
+       let list = values as? [CFTypeRef] {
+        for (index, raw) in list.enumerated() {
+            // 属性取不到时给的是 .axError 占位值，不是元素 —— 不能当成元素往下用
+            if CFGetTypeID(raw) == AXValueGetTypeID(),
+               AXValueGetType(unsafeBitCast(raw, to: AXValue.self)) == .axError { continue }
+            if CFGetTypeID(raw) == CFArrayGetTypeID(), let windows = raw as? [AXUIElement] {
+                elements.append(contentsOf: windows)
+            } else if CFGetTypeID(raw) == AXUIElementGetTypeID() {
+                let one = unsafeBitCast(raw, to: AXUIElement.self)
+                // focused / main 这两个位上的元素必须先过"真窗口"判定（可能是个 sheet/对话框）
+                if index > 0, axIsRealWindow(one) { elements.append(one) }
+            }
+        }
+    }
+
+    // 跨来源去重（同一个窗口可能同时出现在多个属性里）；
+    // 拿不到 CGWindowID 的没法比对，原样留着不去重，宁可重复也不漏
+    var seen = Set<CGWindowID>()
+    var unique: [AXUIElement] = []
+    for e in elements {
+        if let wid = axWindowID(e), !seen.insert(wid).inserted { continue }
+        unique.append(e)
+    }
+
+    // 还有窗口没露面（在别的桌面上）→ 捞。捞回来的单独记一份 ID，
+    // 下面的标题过滤要对它们网开一面（见注释）
+    var recoveredIDs = Set<CGWindowID>()
+    if !cgCandidates.isEmpty {
+        let known = Set(unique.compactMap { axWindowID($0) })
+        for e in hiddenWindowElements(pid: app.processIdentifier,
+                                      missing: cgCandidates.subtracting(known)) {
+            if let wid = axWindowID(e) { recoveredIDs.insert(wid) }
+            unique.append(e)
+        }
+    }
+
+    var result: [WinInfo] = []
+    for w in unique {
+        var title = axText(w, kAXTitleAttribute as String)
+        if title.isEmpty {
+            // ⚠️ 别退回"空标题一律丢掉"。跨桌面捞回来的窗口里存在**真窗口但读不到标题**：
+            // 实测微信有个 700×640 的窗口 —— AXSubrole=AXStandardWindow、关闭/最小化/全屏
+            // 三个按钮齐全、AXPosition/AXSize 都正常、AXRaise 能让它现身（onscreen 由 false 变 true），
+            // 就是 AXTitle 空。丢掉的后果正是用户报的「明明开了两个窗口，面板只显示一个」。
+            //
+            // 宽容只给这条路（`kAXWindows` 自己交出来的空标题条目基本都是隐藏辅助窗，
+            // Chrome 的 1930×139 那种，那条路继续严格），并且两条判据必须同时满足：
+            //   · subrole == AXStandardWindow —— 挡掉 `AXDialog`（实测 Tailscale 那个
+            //     1107×887 的 783，它也会被捞回来且有关闭按钮）和 `AXUnknown`
+            //     （实测微信那个 635×892 的 329，是假货）
+            //   · 窗口上有关闭按钮 —— 元素完整的旁证
+            guard let wid = axWindowID(w), recoveredIDs.contains(wid),
+                  axText(w, kAXSubroleAttribute as String) == "AXStandardWindow",
+                  axHasCloseButton(w) else { continue }
+            title = "未命名窗口"
+        }
+        let minimized = (axValue(w, kAXMinimizedAttribute as String) as? Bool) ?? false
         result.append(WinInfo(title: title, minimized: minimized, ref: w))
     }
     return result
@@ -98,6 +375,39 @@ private func axCloseWindow(_ win: AXUIElement) {
           let raw = b else { return }
     let btn = unsafeBitCast(raw, to: AXUIElement.self)
     AXUIElementPerformAction(btn, kAXPressAction as CFString)
+}
+
+/// 把一个**具体窗口**带到用户眼前（点窗口卡走的就是这条路）。
+///
+/// ⚠️ 只调 `AXUIElementPerformAction(win, kAXRaiseAction)` 是**不够**的，这是个真踩过的坑：
+/// 实测它对微信返回 `success`、`kAXMainAttribute` 也**确实**从 false 翻成了 true，
+/// **但前台应用纹丝不动** —— 因为 AXRaise 只在**应用内部**调整窗口次序，
+/// **不会激活应用本身**。应用还压在别的窗口后面时，它的窗口在"应用内部排第一"
+/// 依然在屏幕后面，用户看到的就是"点了完全没反应"。
+/// 所以顺序必须是：**先把应用整个提到前台（跟应用卡同一套），再选窗口**。
+///
+/// - Parameter reRaiseAfter: 激活是异步的，而且系统在激活一个应用时会把该应用**上次**的
+///   主窗口恢复回来，有可能把刚抬起来的这个顶掉；隔一小会儿再抬一次兜底。
+///   这时面板已经收起，用户看不到任何抖动。传 0 关闭（调试用）。
+private func bringWindowForward(app: NSRunningApplication, win: WinInfo, reRaiseAfter: TimeInterval = 0.35) {
+    if let bundleURL = app.bundleURL {
+        NSWorkspace.shared.open(bundleURL)
+    }
+    if #available(macOS 14.0, *) {
+        app.activate(from: .current)
+    } else {
+        app.activate(options: [.activateIgnoringOtherApps])
+    }
+    // 最小化的窗口：AXRaise 能顺带把它还原（微信实测 min T→F），但不是每个应用都认这套，
+    // 最小化时显式取消一次更稳（对没最小化的窗口设成 false 本身是无害的）。
+    if win.minimized {
+        AXUIElementSetAttributeValue(win.ref, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+    }
+    win.raise()
+    guard reRaiseAfter > 0 else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + reRaiseAfter) {
+        win.raise()
+    }
 }
 
 // MARK: - 进程树收集（彻底关闭：主进程 + 后代 + 同 bundle 路径进程）
@@ -166,8 +476,8 @@ final class AppCardView: NSView {
 
         let name = app.localizedName ?? "未知应用"
         toolTip = windowsCount > 1
-            ? "「\(name)」有 \(windowsCount) 个窗口 · 点 ✕ 彻底关闭 · 点卡片激活"
-            : "点击激活「\(name)」，点右上角 ✕ 彻底关闭"
+            ? "「\(name)」(PID \(app.processIdentifier)) 有 \(windowsCount) 个窗口 · 点 ✕ 彻底关闭整个应用 · 点卡片激活"
+            : "点击激活「\(name)」(PID \(app.processIdentifier))，点右上角 ✕ 彻底关闭整个应用"
 
         let iconView = NSImageView(image: app.icon ?? NSApp.applicationIconImage)
         iconView.imageScaling = .scaleProportionallyUpOrDown
@@ -179,7 +489,12 @@ final class AppCardView: NSView {
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let pidText = windowsCount > 1 ? "PID \(app.processIdentifier) · \(windowsCount) 窗口" : "PID \(app.processIdentifier)"
+        // 副标题负责回答"这张卡是什么"：应用卡必须一眼看出是**整个应用**（总开关），
+        // 不是某个窗口。⚠️ 面板里应用卡和窗口卡是同尺寸同底色的兄弟，光靠位置分不开 ——
+        // 之前这里写的是 `PID 500 · 2 窗口`，结果"微信主窗口"的标题恰好也叫「微信」，
+        // 用户数出"三个微信"（实际是 1 张应用卡 + 2 张窗口卡，数据没错，是长得太像）。
+        // PID 挪去 toolTip 了 —— 120pt 宽的卡片塞不下"整个应用"和 PID 两件事。
+        let pidText = windowsCount > 1 ? "整个应用 · \(windowsCount) 个窗口" : "整个应用"
         let pidLabel = NSTextField(labelWithString: pidText)
         pidLabel.font = .systemFont(ofSize: 10)
         pidLabel.textColor = .secondaryLabelColor
@@ -237,8 +552,12 @@ final class AppCardView: NSView {
         layer.backgroundColor = (isHovering ? NSColor.controlAccentColor : NSColor.white)
             .withAlphaComponent(isHovering ? 0.18 : 0.10).cgColor
         layer.cornerRadius = 10
-        layer.borderWidth = 1
-        layer.borderColor = NSColor.separatorColor.withAlphaComponent(0.7).cgColor
+        // ★ 应用卡描边用 accent 色（窗口卡是普通分隔线色）—— 这是"一眼可分"的第一个信号。
+        // 前提是**应用卡和窗口卡是同尺寸同底色的兄弟**，光靠位置和 9pt 副标题分不开，
+        // 用户会把一张应用卡 + 两张窗口卡数成"三个微信"。第二个信号是副标题「整个应用」，
+        // 两个互为冗余：任一没看清，另一个还认得出。
+        layer.borderWidth = 1.5
+        layer.borderColor = NSColor.controlAccentColor.withAlphaComponent(isHovering ? 0.85 : 0.45).cgColor
         closeButton.contentTintColor = isHovering ? .systemRed : .secondaryLabelColor
     }
 
@@ -261,14 +580,20 @@ final class AppCardView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard !isClosing else { return }
-        // 打开 bundle 等同于点击 Dock 图标：自动切换到该应用所在的桌面并前置
+        // 打开 bundle 等同于点击 Dock 图标：自动切换到该应用所在的桌面并前置。
+        //
+        // ⚠️ 必须带 `.activateAllWindows`：这个应用的窗口可能散在**别的桌面**上，
+        // 而 Chromium 系应用（VSCode / Chrome / 一切 Electron）**只把当前桌面的窗口
+        // 交给辅助功能接口** —— 窗口不叫过来，面板下次刷新照样看不到它们
+        // （实测：VSCode 两窗口在外接屏桌面时，面板在另一块屏只能拿到 0 个窗口）。
+        // 带上这个选项，点一下应用卡就把它的所有窗口（含别的桌面、含最小化的）都带过来。
         if let bundleURL = app.bundleURL {
             NSWorkspace.shared.open(bundleURL)
         }
         if #available(macOS 14.0, *) {
-            app.activate(from: .current)
+            app.activate(from: .current, options: [.activateAllWindows])
         } else {
-            app.activate(options: [.activateIgnoringOtherApps])
+            app.activate(options: [.activateAllWindows])
         }
         // 目的已达成（切到别的应用去了），面板跟着收起
         panel?.collapseAfterActivating(appName: app.localizedName ?? "应用")
@@ -316,7 +641,10 @@ final class WindowCardView: NSView {
         titleLabel.textColor = win.minimized ? .secondaryLabelColor : .labelColor
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let statusLabel = NSTextField(labelWithString: "\(appName) · \(win.minimized ? "已最小化" : "点击打开")")
+        // 副标题不再重复应用名（紧邻的应用卡已经写了，同图标也在，重复就是噪音）。
+        // 这里只回答"这张卡是一个窗口"，和上面「整个应用」形成对照 —— 合起来才拼出层级：
+        // 应用卡（accent 描边 + 整个应用）→ 下面跟它的一排窗口卡。
+        let statusLabel = NSTextField(labelWithString: "窗口 · \(win.minimized ? "已最小化" : "点击打开")")
         statusLabel.font = .systemFont(ofSize: 9)
         statusLabel.textColor = .tertiaryLabelColor
         statusLabel.alignment = .center
@@ -386,8 +714,9 @@ final class WindowCardView: NSView {
     override func mouseExited(with event: NSEvent) { isHovering = false; refreshAppearance() }
 
     override func mouseDown(with event: NSEvent) {
-        // 前置这个具体窗口（最小化的自动还原）
-        win.raise()
+        // 前置这个具体窗口（最小化的自动还原）——里面已经把"激活应用"这一步补上了，
+        // 光 AXRaise 应用还在后台时用户什么都看不见
+        bringWindowForward(app: app, win: win)
         panel?.collapseAfterActivating(appName: app.localizedName ?? "应用")
     }
 
@@ -981,6 +1310,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 状态
     private var isExpanded = false
     private var isPinned = false
+    /// 调试用：让面板渲染时先丢掉最前面 N 个应用，只为导出"关掉几个之后"的演示素材。
+    /// 纯渲染层的事，不会真的去关任何应用。
+    private var debugAppDrop: Int = 0
     private var lastScreenID: UInt32 = 0
     private var screenWatchTimer: Timer?
     private var collapseWork: DispatchWorkItem?
@@ -1071,8 +1403,164 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + "横幅高=\(Int(updateBannerHeight?.constant ?? -1))")
     }
 
+    /// 调试指令 `hidden [应用名关键字]`：把「跨桌面捞窗口」的全过程打出来 ——
+    /// AX 直接给了几个、系统窗口列表说有几个、还差哪些、暴力枚举捞到几个、扫了多少 ID / 花了多久。
+    ///
+    /// 存在的意义：本机**没有屏幕录制权限**，屏幕上到底有几个窗口肉眼看不见，
+    /// 但「系统列表说有 N 个，AX 只给了 M 个，捞回 K 个」这组数字是可断言的。
+    /// 同一个应用不带关键字时会把所有应用都过一遍（会同步跑暴力枚举，慢，仅调试用）。
+    private func debugHiddenWindows(_ arg: String) {
+        let candidates = cgCandidateWindowIDs()
+        let apps = arg.isEmpty ? visibleApps : visibleApps.filter {
+            ($0.localizedName ?? "").localizedCaseInsensitiveContains(arg)
+        }
+        guard !apps.isEmpty else {
+            dbg("hidden: 没有匹配「\(arg)」的运行中应用")
+            return
+        }
+        for app in apps {
+            let pid = app.processIdentifier
+            let cg = candidates[pid] ?? []
+            // 故意不传 cgCandidates：先看"AX 自己肯给的"有几个，才能看出到底漏没漏
+            let direct = axWindows(for: app, cgCandidates: [])
+            let known = Set(direct.compactMap { axWindowID($0.ref) })
+            let missing = cg.subtracting(known)
+            dbg("hidden: 「\(app.localizedName ?? "?")」AX 直接给 \(direct.count) 个 "
+                + "\(direct.map { $0.title }) ｜ 系统列表候选 \(cg.count) 个 ｜ 缺席 \(missing.count) 个 \(missing.sorted())")
+            guard !missing.isEmpty else { continue }
+            let r = bruteForceWindowElements(pid: pid, wanted: missing, ceilID: hiddenScanStartCeil,
+                                             budgetMs: hiddenScanBudgetMs)
+            let titles = r.elements.map { axText($0, kAXTitleAttribute as String) }
+            dbg(String(format: "hidden:   暴力枚举 扫 %d 个 ID / %.0fms（最大有效 ID %d）→ 捞到 %d 个 %@ ｜ 仍缺 %d 个",
+                       r.scanned, r.elapsedMs, Int(r.maxValidID), r.elements.count,
+                       "\(titles)", r.remaining.count))
+        }
+    }
+
+    /// 调试指令 `raise <应用名关键字> [窗口序号]`：模拟「点某张窗口卡」，并打印前台应用的变化。
+    ///
+    /// 存在的意义：本机**没有屏幕录制权限**，"点了到底有没有反应"肉眼看不见，
+    /// 但 `NSWorkspace.frontmostApplication` 的前后变化是能当断言的 ——
+    /// 只调 `AXRaise` 那版在这里会打印「❌ 仍在后面」，补上 activate 之后才会变 ✅。
+    private func debugRaiseWindow(_ arg: String) {
+        let parts = arg.split(separator: " ").map(String.init).filter { !$0.isEmpty }
+        guard let needle = parts.first else {
+            dbg("usage: raise <应用名关键字> [窗口序号]")
+            return
+        }
+        let index = parts.count > 1 ? (Int(parts[1]) ?? 0) : 0
+        guard let app = NSWorkspace.shared.runningApplications.first(where: {
+            ($0.localizedName ?? "").contains(needle)
+        }) else {
+            dbg("raise: 没找到「\(needle)」")
+            return
+        }
+        let wins = axWindows(for: app, cgCandidates: cgCandidateWindowIDs()[app.processIdentifier] ?? [])
+        guard wins.indices.contains(index) else {
+            dbg("raise: 「\(needle)」只有 \(wins.count) 个窗口，取不到 #\(index)")
+            return
+        }
+        let win = wins[index]
+        let before = NSWorkspace.shared.frontmostApplication?.localizedName ?? "-"
+        dbg("raise: 目标=「\(needle)」#\(index) 标题=「\(win.title)」最小化=\(win.minimized) ｜ 前前台=\(before)")
+        bringWindowForward(app: app, win: win)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            guard let self else { return }
+            let after = NSWorkspace.shared.frontmostApplication?.localizedName ?? "-"
+            let ok = (NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier)
+            self.dbg("raise: 0.9s 后前台=\(after) → \(ok ? "✅ 已提到前台" : "❌ 仍在后面")")
+        }
+    }
+
+    /// 把展开态的面板导出成 PNG，给文档配图 / 演示素材用（stdin 指令 `shot`）。
+    ///
+    /// 走的是 AppKit 自己的绘制路径（`cacheDisplay`），**不需要屏幕录制权限** ——
+    /// 这也是本机唯一能拿到面板真实外观的办法（`screencapture` 会报
+    /// `could not create image from display`）。
+    /// ⚠️ 代价是拿不到 WindowServer 合成的毛玻璃模糊：导出的是**实底**（深灰）+
+    /// 真实的内容排版与圆角。要"透出桌面"得在合成阶段自己补一层背景模糊。
+    ///
+    /// `shot` → 一张完整列表；`shot 0 1 2` → 各出一张，数字表示**丢掉最前面几个应用**，
+    /// 用来拼「点掉几个应用」的演示（只改渲染时用的列表，不会真去关任何应用）。
+    private func dumpPanelShots(_ limits: [Int]) {
+        // ⚠️ 必须先钉住：真实光标不在面板上时，hover 看门狗（0.12s）会在展开后
+        // 立刻把它收起来，等 0.6s 再渲染只能拿到收起到一半的中间态
+        // （踩过：导出成 239×118 的怪尺寸）。isPinned 会走 mouseExitedIsland 的
+        // 早退分支，正好拿来临时抑制收起；只动内存变量，不碰按钮外观和 UserDefaults。
+        let pinBefore = isPinned
+        isPinned = true
+        if !isExpanded { expand(activateApp: false) }
+
+        var delay = 0.7
+        for n in limits {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                self.debugAppDrop = max(0, n)
+                self.reload()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) {
+                    self.writePanelShot(label: n > 0 ? "drop\(n)" : "all")
+                }
+            }
+            delay += 0.6
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.3) {
+            self.debugAppDrop = 0
+            self.isPinned = pinBefore
+            self.reload()
+            self.dbg("shot: 导出结束，共 \(limits.count) 张")
+        }
+    }
+
+    private func writePanelShot(label: String) {
+        guard let view = panel.contentView else {
+            dbg("shot: 面板没有 contentView")
+            return
+        }
+        // 临时藏掉「未授权」提示条：正常用起来（授权后）本来就不显示它，
+        // 拿去做演示素材时挂一条橙色警告太出戏。导出完立刻还原。
+        let bannerHidden = authBanner.isHidden
+        let bannerHeight = authBannerHeight.constant
+        authBanner.isHidden = true
+        authBannerHeight.constant = 0
+        view.layoutSubtreeIfNeeded()
+
+        let bounds = view.bounds
+        // 强制 @2x：面板停在哪块屏不由我们定（本机外接屏只有 1x），素材要经得起放大
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: Int(bounds.width * scale),
+                                         pixelsHigh: Int(bounds.height * scale),
+                                         bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else {
+            authBanner.isHidden = bannerHidden
+            authBannerHeight.constant = bannerHeight
+            dbg("shot: 建不出位图")
+            return
+        }
+        rep.size = bounds.size
+        view.cacheDisplay(in: bounds, to: rep)
+
+        authBanner.isHidden = bannerHidden
+        authBannerHeight.constant = bannerHeight
+        view.layoutSubtreeIfNeeded()
+
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+            dbg("shot: PNG 编码失败")
+            return
+        }
+        let path = "/tmp/closeapps-panel-\(label).png"
+        try? data.write(to: URL(fileURLWithPath: path))
+        let f = panel.frame
+        dbg("shot[\(label)]: 已导出 \(path) \(rep.pixelsWide)x\(rep.pixelsHigh)px "
+            + "应用=\(appCount) 卡片=\(cardGrid.subviews.count) "
+            + "panel.frame=(\(Int(f.minX)),\(Int(f.minY))) \(Int(f.width))x\(Int(f.height)) "
+            + "屏幕=\(currentScreen().localizedName)")
+    }
+
     /// 仅调试（stdin 指令 `mask`）：把假刘海的遮罩真的算出来、导出成 PNG、再探四个角的像素。
     /// 形状这事嘴上说不清 —— 直角还是圆角、圆角多大，直接看图 + 报数。
+
     private func dumpMask() {
         let screen = currentScreen()
         let scale = screen.backingScaleFactor
@@ -1272,6 +1760,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         let parts = line.dropFirst(5).split(separator: " ").compactMap { Double($0) }
                         guard parts.count == 2 else { self.dbg("usage: drag <dx> <dy>"); return }
                         self.simulateDrag(dx: CGFloat(parts[0]), dy: CGFloat(parts[1]))
+                        return
+                    }
+                    if line == "shot" || line.hasPrefix("shot ") {
+                        let nums = line.dropFirst(4).split(separator: " ").compactMap { Int($0) }
+                        self.dumpPanelShots(nums.isEmpty ? [0] : nums)
+                        return
+                    }
+                    if line == "hidden" || line.hasPrefix("hidden ") {
+                        self.debugHiddenWindows(String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces))
+                        return
+                    }
+                    if line.hasPrefix("raise ") {
+                        self.debugRaiseWindow(String(line.dropFirst(6)))
                         return
                     }
                     switch line {
@@ -2036,6 +2537,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func expand(activateApp: Bool) {
         collapseWork?.cancel()
         collapseWork = nil
+        // 跨桌面窗口的暴力枚举只在面板展开时做（收起时用户看不到，没必要扫）。必须在 reload 之前置位。
+        panelIsExpandedForScan = true
+        // 扫描一完成就立刻刷一次（不等下一个 2 秒 tick）。没有这一步，面板刚打开那一轮
+        // 必然少一个跨桌面的窗口，要等 2 秒才自己冒出来 —— 用户会以为"有时候不显示"。
+        hiddenScanDidFinish = { [weak self] in
+            guard let self, self.isExpanded else { return }
+            self.reload()
+        }
         // ★ 每一次打开都回初始位置：位置不缓存，上次拖动留下的临时位置在这里清空
         draggedTopLeft = nil
         // 本来就已经展开的话（面板开着又按了一次快捷键之类），位置/形状/内容都到位了，
@@ -2079,6 +2588,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func collapse(animated: Bool) {
         guard isExpanded else { return }
         isExpanded = false
+        panelIsExpandedForScan = false   // 收起就不再扫跨桌面窗口
+        hiddenScanDidFinish = nil
         recorder?.cancelRecording()
         stopRefresh()
         // 录制中途收起：把原来能用的快捷键装回去
@@ -2913,9 +3424,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var visibleApps: [NSRunningApplication] {
         let myPid = ProcessInfo.processInfo.processIdentifier
-        return NSWorkspace.shared.runningApplications.filter {
+        let all = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && !$0.isTerminated && $0.processIdentifier != myPid
         }
+        // ⚠️ 必须自己排序：`runningApplications` 的返回顺序**不保证稳定**，
+        // 不排的话每 2 秒一次的自动刷新会让卡片莫名其妙地跳位置
+        // （踩过：连查三次拿到的顺序都不一样，导出演示素材时"少了的那几个"完全对不上）。
+        // 按本地化名称排，中文走拼音、英文走字母、数字按自然序。
+        .sorted {
+            ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
+        }
+        if debugAppDrop > 0 { return Array(all.dropFirst(debugAppDrop)) }
+        return all
     }
 
     /// 折叠态：只更新数量与授权角标，不碰窗口列表（省电）
@@ -2972,9 +3492,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         var windowsByPid: [pid_t: [WinInfo]] = [:]
         if trusted {
+            pruneHiddenWindowCache(keeping: Set(current.map { $0.processIdentifier }))
+            // 系统窗口列表整轮只取一次给所有应用共用（每个应用各取一次要多花十几毫秒）
+            let cgCandidates = cgCandidateWindowIDs()
             for app in current {
-                // 过滤无标题的隐藏窗口，只有真实可见窗口才计
-                windowsByPid[app.processIdentifier] = axWindows(for: app).filter { !$0.title.isEmpty }
+                windowsByPid[app.processIdentifier] = axWindows(for: app,
+                                                                cgCandidates: cgCandidates[app.processIdentifier] ?? [])
             }
         }
 
@@ -3003,6 +3526,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         cardGrid.setCards(cards)
         emptyLabel.isHidden = !apps.isEmpty
+        // 调试：一眼看出"这次到底有没有认出多窗口应用"——
+        // 面板上少了窗口卡时，先来这里看是 AX 没查到，还是查到了但没建卡。
+        if debugEnabled {
+            let multi = windowsByPid.filter { $0.value.count >= 2 }
+                .map { "\($0.key):\($0.value.count)" }.sorted()
+            dbg("reload: 应用=\(current.count) 多窗口=[\(multi.joined(separator: ","))] 卡片=\(cards.count)")
+        }
         let cost = (CACurrentMediaTime() - started) * 1000
         if cost > 20 {
             dbg("reload 用时=\(Int(cost))ms（\(apps.count) 个应用，开辅助功能后这里会明显变慢）")
