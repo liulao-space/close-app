@@ -6,25 +6,21 @@
 <description>CloseApps 更新分发</description>
 <language>zh</language>
 <item>
-<title>Version 1.2.1</title>
-<pubDate>Thu, 24 Sep 2026 12:05:37 +0800</pubDate>
-<sparkle:version>5</sparkle:version>
-<sparkle:shortVersionString>1.2.1</sparkle:shortVersionString>
+<title>Version 1.2.2</title>
+<pubDate>Thu, 24 Sep 2026 14:13:19 +0800</pubDate>
+<sparkle:version>6</sparkle:version>
+<sparkle:shortVersionString>1.2.2</sparkle:shortVersionString>
 <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
-<enclosure url="https://github.com/liulao-space/close-app/releases/download/v1.2.1/CloseApps.dmg" sparkle:edSignature="YP7GlWD/HOalkfx5nLOHXgu8qcbo5Ip4r6OGH+MqjKj4Ft2kb0sZQZbRojgLNfcHa0vR+hTCGO+BfK2iJLfgCg==" sparkle:version="5" sparkle:shortVersionString="1.2.1" length="1935975" type="application/x-apple-diskimage"/>
+<enclosure url="https://github.com/liulao-space/close-app/releases/download/v1.2.2/CloseApps.dmg" sparkle:edSignature="PxZ29WfLuIqNsjc5xo9KcQmjwWQB+5pGAXZ0MhvXzq0pcdHh0lUf7pTEolVhw8WDghff4t8yEmQjHvFZLhM5BA==" sparkle:version="6" sparkle:shortVersionString="1.2.2" length="1943118" type="application/x-apple-diskimage"/>
 <description><![CDATA[<p>## 修复
 
-- 别的桌面上的窗口现在也能列出来了（Chrome / Edge / VSCode / 微信这类应用）
-- 点窗口卡会把应用一起切到前面，不再「点了没动」
-- 面板刷新不再被没响应的应用拖住 6 秒
-- 窗口数量不再每隔几秒闪一下
-- 应用卡和窗口卡视觉上更好区分
+- 面板里不再凭空多出一个「未命名窗口」。上一版为了让藏在别的桌面上的窗口也能列出来，给一类窗口开了口子，结果把应用残留的**空壳窗口**也放了进来 —— 微信、网易云音乐上都会多出一张没有实际内容的假卡
 
 ## 安装
 
 下载 `CloseApps.dmg`，打开后把 CloseApps 拖进「应用程序」。
 
-装过 v1.2.0 的老用户不用手动下载 —— 展开面板顶部会出现「新版本 1.2.1 可用」的横幅，点一下即可在应用内升级。</p>]]></description>
+装过 v1.2.0 / v1.2.1 的用户不用手动下载 —— 展开面板顶部会出现「新版本 1.2.2 可用」的横幅，点一下即可在应用内升级。</p>]]></description>
 </item>
 </channel>
 </rss>
