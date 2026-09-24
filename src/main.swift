@@ -124,13 +124,6 @@ private func axIsRealWindow(_ e: AXUIElement) -> Bool {
     return axValue(e, kAXCloseButtonAttribute as String) != nil
 }
 
-/// 窗口元素上有没有关闭按钮 —— 比 `axIsRealWindow` 更严一档。
-/// 用来区分「读不到标题的真窗口」（微信那个 700×640：三个按钮齐全）和
-/// 「读不到标题的假货」（同应用的 635×892：sub=AXUnknown、一个按钮都没有）。
-private func axHasCloseButton(_ e: AXUIElement) -> Bool {
-    axValue(e, kAXCloseButtonAttribute as String) != nil
-}
-
 /// 系统窗口列表里「像真窗口」的窗口 ID（层 0 + 尺寸不像工具条）。
 /// 条件故意放得很松：它只用来判断"是不是还有窗口没被 AX 交出来"，
 /// 多报几个 ID 的代价只是多试几次，真正的把关在 `axIsRealWindow`。
@@ -166,8 +159,7 @@ private struct BruteForceResult {
 /// ★★ 扫描上界必须按**固定值**（`ceilID`）扫，**绝对不要**改成"连续 N 个 ID 取不到元素就停"。
 /// 踩过的坑：元素 ID 空间里存在**很大的空洞**。实测微信 20 个有效元素分布在 46~706，
 /// 其中 `333 → 703` 之间就空了 **370** 个 ID；当时用"连续 300 落空即停"，扫到 334 就收工，
-/// 把 703/704/706 三个元素整个漏掉 —— 而 703 正是用户要看的那扇窗口
-/// （700×640、subrole=AXStandardWindow），表现就是"窗口明明开着，面板不显示"。
+/// 把 703/704/706 三个元素整个漏掉（703 就是后面 `axWindows` 里说到的那个 700×640 空壳窗口）。
 /// 按 3000 的上界扫只要 41ms（13.8µs/个 ID），快且不会漏；真遇到元素特别多的应用，
 /// 由 `hiddenWindowElements` 里的"顶到边界就翻倍"逻辑自动外扩。
 private func bruteForceWindowElements(pid: pid_t, wanted: Set<CGWindowID>,
@@ -332,38 +324,40 @@ private func axWindows(for app: NSRunningApplication, cgCandidates: Set<CGWindow
         unique.append(e)
     }
 
-    // 还有窗口没露面（在别的桌面上）→ 捞。捞回来的单独记一份 ID，
-    // 下面的标题过滤要对它们网开一面（见注释）
-    var recoveredIDs = Set<CGWindowID>()
+    // 还有窗口没露面（在别的桌面上）→ 捞一份进来
     if !cgCandidates.isEmpty {
         let known = Set(unique.compactMap { axWindowID($0) })
         for e in hiddenWindowElements(pid: app.processIdentifier,
                                       missing: cgCandidates.subtracting(known)) {
-            if let wid = axWindowID(e) { recoveredIDs.insert(wid) }
             unique.append(e)
         }
     }
 
     var result: [WinInfo] = []
     for w in unique {
-        var title = axText(w, kAXTitleAttribute as String)
-        if title.isEmpty {
-            // ⚠️ 别退回"空标题一律丢掉"。跨桌面捞回来的窗口里存在**真窗口但读不到标题**：
-            // 实测微信有个 700×640 的窗口 —— AXSubrole=AXStandardWindow、关闭/最小化/全屏
-            // 三个按钮齐全、AXPosition/AXSize 都正常、AXRaise 能让它现身（onscreen 由 false 变 true），
-            // 就是 AXTitle 空。丢掉的后果正是用户报的「明明开了两个窗口，面板只显示一个」。
-            //
-            // 宽容只给这条路（`kAXWindows` 自己交出来的空标题条目基本都是隐藏辅助窗，
-            // Chrome 的 1930×139 那种，那条路继续严格），并且两条判据必须同时满足：
-            //   · subrole == AXStandardWindow —— 挡掉 `AXDialog`（实测 Tailscale 那个
-            //     1107×887 的 783，它也会被捞回来且有关闭按钮）和 `AXUnknown`
-            //     （实测微信那个 635×892 的 329，是假货）
-            //   · 窗口上有关闭按钮 —— 元素完整的旁证
-            guard let wid = axWindowID(w), recoveredIDs.contains(wid),
-                  axText(w, kAXSubroleAttribute as String) == "AXStandardWindow",
-                  axHasCloseButton(w) else { continue }
-            title = "未命名窗口"
-        }
+        let title = axText(w, kAXTitleAttribute as String)
+
+        // ⚠️⚠️ 空标题一律丢弃 —— 不要给"跨桌面捞回来的"开任何口子。
+        //
+        // 上一版在这里开过口子：跨桌面捞回 + `subrole == AXStandardWindow` + 有关闭按钮的
+        // 空标题窗口，显示成「未命名窗口」。当时观察到微信有个 700×640 的窗口"三个按钮
+        // 齐全、AXPosition/AXSize 正常、AXRaise 还能让它现身"，被我误判成「真窗口读不到
+        // 标题」，并拿它去解释"VSCode 两个窗口只显示一个"。
+        //
+        // 实测证明那是**误判**，而且这个口子会稳定漏出一张假卡：
+        //   · 那个 700×640 根本不是用户的窗口 —— 它是微信残留的**空壳窗口**：直接子元素
+        //     只有 3 个 `AXButton`（标题栏那三个），**没有任何内容**；同类的还有网易云音乐
+        //     一个 1058×752（子元素 0 个）、Tailscale 一个 1107×887（`AXDialog`）。
+        //     全是"应用建了窗口但里面什么都没有"的空壳。
+        //   · 更糟的是它**多数时候就躺在 `kAXWindows` 里**（它在当前显示的屏幕上，只是被
+        //     别的窗口挡住）。而 `hiddenWindowElements` 为了修抖动改成了"返回缓存里的全部
+        //     元素、不再按 missing 过滤"，于是连它一起被当成"捞回来的"收进 `recoveredIDs`
+        //     —— 口子对**每个**用户、**每个**应用都会开，面板里凭空多一张「未命名窗口」。
+        //
+        // 取舍依据（实测 11 个窗口）：空标题的 3 个**全是空壳**，有标题的 8 个**全是正常
+        // 窗口**。「有标题」这条判据零误杀，而且天然免疫"窗口在别的桌面 / 被遮挡"这些干扰。
+        if title.isEmpty { continue }
+
         let minimized = (axValue(w, kAXMinimizedAttribute as String) as? Bool) ?? false
         result.append(WinInfo(title: title, minimized: minimized, ref: w))
     }
@@ -1440,6 +1434,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 调试指令 `wins [应用名关键字]`：把**面板最终会显示**的窗口列出来。
+    ///
+    /// 与 `hidden` 的区别很关键：`hidden` 故意传空 `cgCandidates`（只想看"AX 自己肯给
+    /// 什么"），**走不到跨桌面捞回那条路**；`wins` 走的是和 `reload()` 完全相同的一条路
+    /// （带 `cgCandidates`），所以它打印出来的就是用户真正会在面板里看到的窗口卡。
+    ///
+    /// 顺手把"被丢弃的空标题窗口"也报一份 —— 幽灵窗口到底有没有被挡掉，一眼就能确认，
+    /// 不用再去猜（这个坑踩过：只看截图会以为没事，因为那一刻幽灵窗口恰好不在场）。
+    private func debugListWindows(_ arg: String) {
+        let candidates = cgCandidateWindowIDs()
+        let apps = arg.isEmpty ? visibleApps : visibleApps.filter {
+            ($0.localizedName ?? "").localizedCaseInsensitiveContains(arg)
+        }
+        guard !apps.isEmpty else {
+            dbg("wins: 没有匹配「\(arg)」的运行中应用")
+            return
+        }
+        for app in apps {
+            let pid = app.processIdentifier
+            let cg = candidates[pid] ?? []
+            let direct = axWindows(for: app, cgCandidates: [])
+            let full = axWindows(for: app, cgCandidates: cg)
+            let titles = full.map { "「\($0.title)」\($0.minimized ? "[最小化]" : "")" }.joined(separator: " ")
+            dbg("wins: 「\(app.localizedName ?? "?")」面板显示 \(full.count) 个: \(titles.isEmpty ? "（无）" : titles)")
+            dbg("wins:   AX 直给 \(direct.count) 个 \(direct.map { "「\($0.title)」" }) ｜ 系统候选 \(cg.count) 个")
+            guard !cg.isEmpty else { continue }
+            let r = bruteForceWindowElements(pid: pid, wanted: cg, ceilID: hiddenScanStartCeil,
+                                             budgetMs: hiddenScanBudgetMs)
+            let blanks = r.elements.filter { axText($0, kAXTitleAttribute as String).isEmpty }
+            guard !blanks.isEmpty else { continue }
+            let subs = blanks.map { axText($0, kAXSubroleAttribute as String) }
+            dbg("wins:   空标题 \(blanks.count) 个（已丢弃）subrole=\(subs)")
+        }
+    }
+
     /// 调试指令 `raise <应用名关键字> [窗口序号]`：模拟「点某张窗口卡」，并打印前台应用的变化。
     ///
     /// 存在的意义：本机**没有屏幕录制权限**，"点了到底有没有反应"肉眼看不见，
@@ -1772,6 +1801,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     if line == "hidden" || line.hasPrefix("hidden ") {
                         self.debugHiddenWindows(String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces))
+                        return
+                    }
+                    if line == "wins" || line.hasPrefix("wins ") {
+                        self.debugListWindows(String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces))
                         return
                     }
                     if line.hasPrefix("raise ") {
