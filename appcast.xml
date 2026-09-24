@@ -6,15 +6,25 @@
 <description>CloseApps 更新分发</description>
 <language>zh</language>
 <item>
-<title>Version 1.2.0</title>
-<pubDate>Wed, 23 Sep 2026 11:25:47 +0800</pubDate>
-<sparkle:version>4</sparkle:version>
-<sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
+<title>Version 1.2.1</title>
+<pubDate>Thu, 24 Sep 2026 12:03:58 +0800</pubDate>
+<sparkle:version>5</sparkle:version>
+<sparkle:shortVersionString>1.2.1</sparkle:shortVersionString>
 <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
-<enclosure url="https://github.com/liulao-space/close-app/releases/download/v1.2.0/CloseApps.dmg" sparkle:edSignature="5/tycYi1wuySegJHb6hs2Zjh1gFhuFUDDGfDu+7NEixXOz53c5ncWfXhEUFYFUnTUt9D0qiE3Mp5Uac8dh0TDg==" sparkle:version="4" sparkle:shortVersionString="1.2.0" length="1876618" type="application/x-apple-diskimage"/>
-<description><![CDATA[
-<p>接入 Sparkle 应用内自动更新。</p>
-]]></description>
+<enclosure url="https://github.com/liulao-space/close-app/releases/download/v1.2.1/CloseApps.app.dmg" sparkle:edSignature="0HupBzvtzbQRY7kvkzO8wBkLmrKPjtPM4NBGcn9StHSIy+SXFJ128uNezsHQzSVIry5UnkjLO7937+BJ9yyyCw==" sparkle:version="5" sparkle:shortVersionString="1.2.1" length="1935973" type="application/x-apple-diskimage"/>
+<description><![CDATA[<p>## 修复
+
+- 别的桌面上的窗口现在也能列出来了（Chrome / Edge / VSCode / 微信这类应用）
+- 点窗口卡会把应用一起切到前面，不再「点了没动」
+- 面板刷新不再被没响应的应用拖住 6 秒
+- 窗口数量不再每隔几秒闪一下
+- 应用卡和窗口卡视觉上更好区分
+
+## 安装
+
+下载 `CloseApps.dmg`，打开后把 CloseApps 拖进「应用程序」。
+
+装过 v1.2.0 的老用户不用手动下载 —— 展开面板顶部会出现「新版本 1.2.1 可用」的横幅，点一下即可在应用内升级。</p>]]></description>
 </item>
 </channel>
 </rss>
